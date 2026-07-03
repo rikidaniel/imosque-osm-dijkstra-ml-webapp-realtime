@@ -1,0 +1,178 @@
+// iMosque Progressive Web App - Service Worker
+// Strategi: CacheFirst untuk aset statis & tile peta, NetworkFirst untuk API
+
+const CACHE_VERSION = "imosque-v1";
+const STATIC_CACHE = "imosque-static-v1";
+const TILE_CACHE = "imosque-tiles-v1";
+const API_CACHE = "imosque-api-v1";
+
+// Aset yang akan di-precache saat install
+const PRECACHE_URLS = [
+  "/",
+];
+
+// === INSTALL ===
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches.open(STATIC_CACHE).then((cache) => cache.addAll(PRECACHE_URLS))
+  );
+  self.skipWaiting();
+});
+
+// === ACTIVATE ===
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(
+        keys
+          .filter((key) => key !== STATIC_CACHE && key !== TILE_CACHE && key !== API_CACHE)
+          .map((key) => caches.delete(key))
+      )
+    )
+  );
+  self.clients.claim();
+});
+
+// === FETCH ===
+self.addEventListener("fetch", (event) => {
+  // 1. Abaikan skema non-http/https (seperti chrome-extension://, about:, dll)
+  if (!event.request.url.startsWith("http://") && !event.request.url.startsWith("https://")) {
+    return;
+  }
+
+  // 2. Abaikan method non-GET (seperti POST, PUT, DELETE) dari strategi caching.
+  // Biarkan browser memproses request tersebut secara langsung secara default.
+  if (event.request.method !== "GET") {
+    return;
+  }
+
+  const url = new URL(event.request.url);
+
+  // 3. Map Tiles (OpenStreetMap, CartoDB, dll) → CacheFirst (30 hari)
+  if (
+    url.hostname.includes("tile.openstreetmap.org") ||
+    url.hostname.includes("basemaps.cartocdn.com")
+  ) {
+    event.respondWith(cacheFirst(event.request, TILE_CACHE, 30 * 24 * 60 * 60));
+    return;
+  }
+
+  // 4. API Backend → NetworkFirst (data realtime, fallback ke cache jika offline)
+  if (url.pathname.startsWith("/api/") || url.hostname === "127.0.0.1" || url.hostname === "localhost") {
+    if (url.port === "8000" || url.pathname.startsWith("/api/")) {
+      event.respondWith(networkFirst(event.request, API_CACHE, 3000));
+      return;
+    }
+  }
+
+  // 3. Aset statis Next.js (_next/static/) → CacheFirst
+  if (url.pathname.startsWith("/_next/static/")) {
+    event.respondWith(cacheFirst(event.request, STATIC_CACHE, 365 * 24 * 60 * 60));
+    return;
+  }
+
+  // 4. Halaman HTML navigasi → NetworkFirst (agar selalu fresh)
+  if (event.request.mode === "navigate") {
+    event.respondWith(networkFirst(event.request, STATIC_CACHE, 3000));
+    return;
+  }
+
+  // 5. Aset lainnya (font, gambar, dll) → StaleWhileRevalidate
+  event.respondWith(staleWhileRevalidate(event.request, STATIC_CACHE));
+});
+
+// === STRATEGI CACHING ===
+
+// CacheFirst: Ambil dari cache dulu, kalau tidak ada baru ke network
+async function cacheFirst(request, cacheName, maxAgeSeconds) {
+  const cache = await caches.open(cacheName);
+  const cached = await cache.match(request);
+
+  if (cached) {
+    // Cek apakah masih segar
+    const dateHeader = cached.headers.get("sw-cache-date");
+    if (dateHeader) {
+      const age = (Date.now() - new Date(dateHeader).getTime()) / 1000;
+      if (age > maxAgeSeconds) {
+        // Expired, fetch baru di background
+        fetchAndCache(request, cache);
+        return cached; // Tetap kembalikan yang lama dulu
+      }
+    }
+    return cached;
+  }
+
+  return fetchAndCache(request, cache);
+}
+
+// NetworkFirst: Coba network dulu dengan timeout, fallback ke cache
+async function networkFirst(request, cacheName, timeoutMs) {
+  const cache = await caches.open(cacheName);
+
+  try {
+    const response = await promiseTimeout(fetch(request), timeoutMs);
+    if (response.ok) {
+      // Clone dan simpan ke cache
+      const cloned = response.clone();
+      const headers = new Headers(cloned.headers);
+      headers.set("sw-cache-date", new Date().toISOString());
+      const body = await cloned.blob();
+      cache.put(request, new Response(body, {
+        status: cloned.status,
+        statusText: cloned.statusText,
+        headers: headers,
+      }));
+    }
+    return response;
+  } catch (err) {
+    const cached = await cache.match(request);
+    return cached || new Response(JSON.stringify({ error: "Offline" }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}
+
+// StaleWhileRevalidate: Kembalikan cache langsung, update di background
+async function staleWhileRevalidate(request, cacheName) {
+  const cache = await caches.open(cacheName);
+  const cached = await cache.match(request);
+
+  const fetchPromise = fetch(request).then((response) => {
+    if (response.ok) {
+      cache.put(request, response.clone());
+    }
+    return response;
+  }).catch(() => cached);
+
+  return cached || fetchPromise;
+}
+
+// Helper: Fetch dan simpan ke cache
+async function fetchAndCache(request, cache) {
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cloned = response.clone();
+      const headers = new Headers(cloned.headers);
+      headers.set("sw-cache-date", new Date().toISOString());
+      const body = await cloned.blob();
+      cache.put(request, new Response(body, {
+        status: cloned.status,
+        statusText: cloned.statusText,
+        headers: headers,
+      }));
+    }
+    return response;
+  } catch (err) {
+    return new Response("Offline", { status: 503 });
+  }
+}
+
+// Helper: Promise dengan timeout
+function promiseTimeout(promise, ms) {
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("Timeout")), ms)
+  );
+  return Promise.race([promise, timeout]);
+}

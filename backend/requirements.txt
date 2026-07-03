@@ -10,3 +10,4 @@ shapely==2.0.6
 pyproj==3.7.0
 requests==2.32.3
 python-multipart==0.0.9
+python-arango==7.9.0

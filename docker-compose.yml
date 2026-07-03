@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  arangodb:
+    image: arangodb:3.11.8
+    container_name: imosque_arangodb
+    environment:
+      - ARANGO_ROOT_PASSWORD=imosque_password
+    ports:
+      - "8529:8529"
+    volumes:
+      - arangodb_data:/var/lib/arangodb3
+    restart: unless-stopped
+
+volumes:
+  arangodb_data:

@@ -5,9 +5,9 @@ from pathlib import Path
 import sys
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_DIR / "backend"))
+sys.path.insert(0, str(PROJECT_DIR))
 
-from app.osm_graph import DEFAULT_GRAPHML, build_osm_graph_for_bbox, build_osm_graph_for_route  # noqa: E402
+from backend.app.infrastructure.services.osm_graph import DEFAULT_GRAPHML, build_osm_graph_for_bbox, build_osm_graph_for_route  # noqa: E402
 
 
 def main():

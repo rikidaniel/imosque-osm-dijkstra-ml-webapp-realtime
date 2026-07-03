@@ -159,16 +159,18 @@ http://127.0.0.1:8000/docs
 
 ### 3. Jalankan frontend
 
-Buka terminal baru dari root project:
+Buka terminal baru dari root project, lalu masuk ke folder `frontend` dan jalankan Next.js:
 
 ```bash
-python -m http.server 5500
+cd frontend
+npm install
+npm run dev
 ```
 
-Lalu buka:
+Lalu buka di browser:
 
 ```text
-http://127.0.0.1:5500/frontend/index.html
+http://localhost:3000
 ```
 
 ## Cara Ganti Dataset dari Frontend
@@ -202,15 +204,17 @@ Catatan: build OSM butuh internet dan bisa memakan waktu tergantung luas buffer 
 ## Endpoint API Penting
 
 ```text
-GET  /api/health
-GET  /api/datasets
-POST /api/datasets/upload
-POST /api/datasets/active
-POST /api/pipeline/run?dataset_id=<id>
-GET  /api/profile?dataset_id=<id>
-GET  /api/mosques?dataset_id=<id>&limit=3000
-POST /api/osm/build-route
-POST /api/route
+GET  /api/v1/health
+GET  /api/v1/datasets
+POST /api/v1/datasets/upload
+POST /api/v1/datasets/active
+POST /api/v1/pipeline/run?dataset_id=<id>
+GET  /api/v1/profile?dataset_id=<id>
+GET  /api/v1/mosques?dataset_id=<id>&limit=3000
+POST /api/v1/routes/recommend
+POST /api/v1/routes/benchmark
+GET  /api/v1/routing-profiles
+GET  /api/v1/routes/{route_id}
 ```
 
 Contoh upload dataset dilakukan dari frontend menggunakan `multipart/form-data`.

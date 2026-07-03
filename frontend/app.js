@@ -1,4 +1,5 @@
 const API_BASE = "http://127.0.0.1:8000";
+const UI_STATE_KEY = "imosque-ui-state-v2";
 
 // Inisialisasi Peta Leaflet dengan koordinat Tangerang/Banten
 const map = L.map("map").setView([-6.1783, 106.6319], 11);
@@ -29,6 +30,7 @@ let recommendedMarker = null;
 let datasets = [];
 let activeDatasetId = null;
 let nearestMosques = [];
+let isRestoringState = false;
 
 // Elemen DOM
 const statusEl = document.getElementById("status");
@@ -40,6 +42,90 @@ const btnToggleSidebar = document.getElementById("btnToggleSidebar");
 const toggleIcon = document.getElementById("toggleIcon");
 const routeNoticeEl = document.getElementById("routeNotice");
 const nearestListEl = document.getElementById("nearestList");
+
+function readUiState() {
+  const hashState = readUrlState();
+  try {
+    const storedState = JSON.parse(localStorage.getItem(UI_STATE_KEY) || "{}");
+    return { ...storedState, ...hashState };
+  } catch (_) {
+    return hashState;
+  }
+}
+
+function saveUiState(patch = {}) {
+  const previous = readUiState();
+  const next = { ...previous, ...patch, updated_at: new Date().toISOString() };
+  try {
+    localStorage.setItem(UI_STATE_KEY, JSON.stringify(next));
+  } catch (_) {
+    // Browser storage can be disabled/full; the app should keep working.
+  }
+  writeUrlState(next);
+}
+
+function readUrlState() {
+  const hash = window.location.hash || "";
+  if (!hash.startsWith("#state=")) return {};
+  try {
+    return JSON.parse(decodeURIComponent(hash.slice("#state=".length)));
+  } catch (_) {
+    return {};
+  }
+}
+
+function compactUrlState(state) {
+  return {
+    dataset_id: state.dataset_id || null,
+    active_tab: state.active_tab || "tab-dataset",
+    algorithm: state.algorithm || "dijkstra",
+    current_time: state.current_time || "",
+    prayer_time: state.prayer_time || "",
+    max_candidates: state.max_candidates || "6",
+    buffer_km: state.buffer_km || "6",
+    auto_build: typeof state.auto_build === "boolean" ? state.auto_build : false,
+    start: state.start || null,
+    end: state.end || null,
+    map: state.map || null
+  };
+}
+
+function writeUrlState(state) {
+  try {
+    const compact = compactUrlState(state);
+    const nextHash = `#state=${encodeURIComponent(JSON.stringify(compact))}`;
+    if (window.location.hash !== nextHash) {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${nextHash}`);
+    }
+  } catch (_) {
+    // Keep UI state best-effort only.
+  }
+}
+
+function markerState(marker) {
+  if (!marker) return null;
+  const latlng = marker.getLatLng();
+  return { lat: latlng.lat, lng: latlng.lng };
+}
+
+function persistUiState(extra = {}) {
+  if (isRestoringState) return;
+  const center = map.getCenter();
+  saveUiState({
+    dataset_id: datasetSelect?.value || activeDatasetId || null,
+    active_tab: document.querySelector(".tab-btn.active")?.getAttribute("data-tab") || "tab-dataset",
+    algorithm: document.getElementById("algorithm")?.value || "dijkstra",
+    current_time: document.getElementById("currentTime")?.value || "",
+    prayer_time: document.getElementById("prayerTime")?.value || "",
+    max_candidates: document.getElementById("maxCandidates")?.value || "6",
+    buffer_km: document.getElementById("bufferKm")?.value || "6",
+    auto_build: Boolean(document.getElementById("autoBuild")?.checked),
+    start: markerState(startMarker),
+    end: markerState(endMarker),
+    map: { lat: center.lat, lng: center.lng, zoom: map.getZoom() },
+    ...extra
+  });
+}
 
 // Custom DIV Icon Premium untuk Leaflet
 const startIcon = L.divIcon({
@@ -93,6 +179,34 @@ function tierValue(tier) {
   return ["A", "B", "C", "D"].includes(value) ? value : "D";
 }
 
+function isLocalGraphRoute(data) {
+  return data?.algorithm === "Dijkstra" || data?.algorithm === "A*";
+}
+
+function routeLineColor(data) {
+  if (data?.algorithm === "Dijkstra") return "#2d6a4f";
+  if (data?.algorithm === "A*") return "#7c3aed";
+  return "#f59e0b";
+}
+
+function routingModeLabel(data) {
+  if (data?.algorithm === "Dijkstra") return "Dijkstra Lokal";
+  if (data?.algorithm === "A*") return "A* Lokal";
+  if (data?.algorithm === "OSRM Road Route") return "OSRM Fallback";
+  if (data?.algorithm === "Local Approximation") return "Perkiraan Lokal";
+  return "Rute Jalan";
+}
+
+function routingModeNote(data) {
+  if (isLocalGraphRoute(data)) {
+    return "Dijkstra/A* lokal aktif: shortest path dihitung pada graph jalan OpenStreetMap dengan bobot travel_time.";
+  }
+  if (data?.algorithm === "OSRM Road Route") {
+    return "Bukan Dijkstra lokal. Backend memakai OSRM fallback karena graph OSM lokal belum tersedia/cocok atau Overpass gagal.";
+  }
+  return "Bukan Dijkstra lokal. Rute ini adalah perkiraan lokal tanpa graph jalan OSM.";
+}
+
 function clearRouteArtifacts() {
   if (routeLayer) {
     routeLayer.remove();
@@ -104,6 +218,70 @@ function clearRouteArtifacts() {
   }
   resultEl.classList.add("empty");
   resultEl.textContent = "Belum ada rute aktif. Silakan tentukan titik awal & tujuan di Tab Rute.";
+  if (!isRestoringState) saveUiState({ last_route: null });
+}
+
+function saveLastRoute(data, datasetId) {
+  const routeState = {
+    dataset_id: datasetId,
+    algorithm: data.algorithm,
+    recommended_mosque: data.recommended_mosque,
+    route_summary: data.route_summary,
+    route_geojson: data.route_geojson,
+    candidate_count: data.candidate_count,
+    restored_at: new Date().toISOString()
+  };
+  try {
+    const encoded = JSON.stringify(routeState);
+    if (encoded.length < 1000000) {
+      saveUiState({ last_route: routeState });
+    }
+  } catch (_) {
+    saveUiState({ last_route: null });
+  }
+}
+
+function restoreLastRoute() {
+  const state = readUiState();
+  const data = state.last_route;
+  if (!data?.route_geojson?.geometry?.coordinates?.length || !data.recommended_mosque) return;
+  if (state.dataset_id && data.dataset_id && state.dataset_id !== data.dataset_id) return;
+
+  isRestoringState = true;
+  clearRouteArtifacts();
+  isRestoringState = false;
+  routeLayer = L.geoJSON(data.route_geojson, {
+    style: {
+      color: routeLineColor(data),
+      weight: 6,
+      opacity: 0.85
+    }
+  }).addTo(map);
+
+  const m = data.recommended_mosque;
+  recommendedMarker = L.marker([m.latitude, m.longitude], { icon: recommendedIcon })
+    .addTo(map)
+    .bindTooltip(`Rekomendasi Utama: ${escapeHtml(m.name || "Masjid")}`, { sticky: true })
+    .bindPopup(`<b>Masjid Rekomendasi Terpilih:</b><br>${escapeHtml(m.name || "Masjid")}`);
+
+  resultEl.classList.remove("empty");
+  resultEl.innerHTML = `
+    <div class="badge-row">
+      <span class="badge-algo">${escapeHtml(data.algorithm)}</span>
+      <span class="badge-algo">${escapeHtml(routingModeLabel(data))}</span>
+      <span class="badge-algo">${escapeHtml((data.dataset_id || selectedDatasetId()).toUpperCase())}</span>
+    </div>
+    <h3 class="recommendation-title">${escapeHtml(m.name || "Masjid")}</h3>
+    <p class="recommendation-meta">${escapeHtml(m.province || "")} ${escapeHtml(m.kabko || "")} - ${escapeHtml(m.kecamatan || "")}</p>
+    <div class="recommendation-stats" style="margin-top: 10px;">
+      <div class="stat-item">Jarak Total: <strong>${escapeHtml(data.route_summary?.distance_km ?? "-")} km</strong></div>
+      <div class="stat-item">Waktu Total: <strong>${escapeHtml(data.route_summary?.estimated_time_minutes ?? "-")} mnt</strong></div>
+      <div class="stat-item">Skor Akhir: <strong>${escapeHtml(data.route_summary?.multi_objective_score ?? "-")}</strong></div>
+    </div>
+    <div class="mode-note ${isLocalGraphRoute(data) ? "success" : "warning"}">${escapeHtml(routingModeNote(data))}</div>
+    <p class="hint-text" style="color: var(--text-main); margin-bottom: 12px; font-weight: 500;">Rute terakhir dipulihkan dari browser.</p>
+  `;
+  setRouteNotice(`Rute terakhir dipulihkan: ${routingModeLabel(data)}.`, isLocalGraphRoute(data) ? "success" : "warning");
 }
 
 function clearNearestMosques(message = "Pilih titik awal untuk melihat rekomendasi masjid terdekat.") {
@@ -124,11 +302,11 @@ function describePointState() {
 
 function getTierColor(tier) {
   switch ((tier || "").toUpperCase()) {
-    case "A": return "#2d6a4f";
-    case "B": return "#52b788";
-    case "C": return "#f59e0b";
-    case "D": return "#64748b";
-    default: return "#94a3b8";
+    case "A": return "#2563eb";
+    case "B": return "#7c3aed";
+    case "C": return "#f97316";
+    case "D": return "#334155";
+    default: return "#64748b";
   }
 }
 
@@ -181,6 +359,7 @@ function switchTab(tabId) {
     if (panel.id === tabId) panel.classList.add("active");
     else panel.classList.remove("active");
   });
+  persistUiState({ active_tab: tabId });
 }
 
 // Helper untuk Loading State pada Button
@@ -270,6 +449,7 @@ function describeDataset(item) {
 async function refreshDatasets() {
   try {
     const data = await api("/api/datasets");
+    const savedState = readUiState();
     datasets = data.items || [];
     activeDatasetId = data.active_dataset_id;
     datasetSelect.innerHTML = "";
@@ -282,6 +462,9 @@ async function refreshDatasets() {
       if (item.dataset_id === activeDatasetId) opt.selected = true;
       datasetSelect.appendChild(opt);
     });
+    if (savedState.dataset_id && datasets.some(item => item.dataset_id === savedState.dataset_id)) {
+      datasetSelect.value = savedState.dataset_id;
+    }
     const current = datasets.find(d => d.dataset_id === selectedDatasetId());
     datasetInfo.textContent = current ? describeDataset(current) : "Belum ada dataset.";
   } catch (err) {
@@ -296,6 +479,45 @@ function fitMapToProfile(profile) {
   if (bounds.isValid()) map.flyToBounds(bounds, { padding: [30, 30] });
 }
 
+function isValidSavedPoint(point) {
+  return point && Number.isFinite(Number(point.lat)) && Number.isFinite(Number(point.lng));
+}
+
+function restoreUiState() {
+  const state = readUiState();
+  isRestoringState = true;
+  try {
+    if (state.algorithm) document.getElementById("algorithm").value = state.algorithm;
+    if (state.current_time) document.getElementById("currentTime").value = state.current_time;
+    if (state.prayer_time) document.getElementById("prayerTime").value = state.prayer_time;
+    if (state.max_candidates) document.getElementById("maxCandidates").value = state.max_candidates;
+    if (state.buffer_km) document.getElementById("bufferKm").value = state.buffer_km;
+    if (typeof state.auto_build === "boolean") document.getElementById("autoBuild").checked = state.auto_build;
+
+    if (state.map && Number.isFinite(Number(state.map.lat)) && Number.isFinite(Number(state.map.lng)) && Number.isFinite(Number(state.map.zoom))) {
+      map.setView([Number(state.map.lat), Number(state.map.lng)], Number(state.map.zoom), { animate: false });
+    }
+
+    if (isValidSavedPoint(state.start)) {
+      startMarker = L.marker([Number(state.start.lat), Number(state.start.lng)], { icon: startIcon })
+        .addTo(map)
+        .bindTooltip("Titik Awal (Start)", { sticky: true })
+        .bindPopup("Titik Awal (Start)");
+    }
+    if (isValidSavedPoint(state.end)) {
+      endMarker = L.marker([Number(state.end.lat), Number(state.end.lng)], { icon: endIcon })
+        .addTo(map)
+        .bindTooltip("Titik Tujuan (Destination)", { sticky: true })
+        .bindPopup("Titik Tujuan (Destination)");
+    }
+
+    if (state.active_tab) switchTab(state.active_tab);
+    setRouteNotice(describePointState(), startMarker || endMarker ? "success" : "");
+  } finally {
+    isRestoringState = false;
+  }
+}
+
 // Event Actions
 async function activateSelectedDataset({ loadMarkers = true } = {}) {
   const originalText = "Gunakan";
@@ -307,6 +529,7 @@ async function activateSelectedDataset({ loadMarkers = true } = {}) {
     
     const data = await apiForm("/api/datasets/active", form);
     activeDatasetId = data.active_dataset_id;
+    persistUiState({ dataset_id: activeDatasetId });
     fitMapToProfile(data.profile);
     await refreshDatasets();
     await refreshStatus();
@@ -354,6 +577,7 @@ async function uploadDataset() {
     activeDatasetId = data.dataset_id;
     await refreshDatasets();
     datasetSelect.value = data.dataset_id;
+    persistUiState({ dataset_id: data.dataset_id });
     fitMapToProfile(data.profile);
     await loadMosques();
     setStatus(`Dataset berhasil diupload & diperkaya dengan ML. Dataset aktif: ${data.dataset_id}.`);
@@ -571,7 +795,12 @@ async function routeToNearestMosque(mosqueId) {
     const start = startMarker.getLatLng();
     const did = selectedDatasetId();
     setLoading("btnRoute", true, originalText);
-    setRouteNotice("Menghitung rute tercepat ke masjid terpilih...", "loading");
+    setRouteNotice(
+      document.getElementById("autoBuild").checked
+        ? "Mencoba cache/auto-build cepat; jika area terlalu besar akan fallback ke OSRM."
+        : "Menghitung rute jalan OSRM ke masjid terpilih...",
+      "loading"
+    );
     const data = await api("/api/route/to-mosque", {
       method: "POST",
       timeoutMs: 60000,
@@ -590,9 +819,10 @@ async function routeToNearestMosque(mosqueId) {
       throw new Error("Backend tidak mengembalikan geometri rute yang valid.");
     }
     clearRouteArtifacts();
+    saveLastRoute(data, did);
     routeLayer = L.geoJSON(data.route_geojson, {
       style: {
-        color: data.algorithm === "Dijkstra" ? "#2d6a4f" : "#7c3aed",
+        color: routeLineColor(data),
         weight: 6,
         opacity: 0.88
       }
@@ -606,13 +836,10 @@ async function routeToNearestMosque(mosqueId) {
       .bindPopup(`<b>Masjid Terpilih:</b><br>${escapeHtml(m.name || "Masjid")}`)
       .openPopup();
 
-    const modeNote = data.algorithm === "Dijkstra" || data.algorithm === "A*"
-      ? "Dijkstra/A* lokal aktif pada graph jalan OpenStreetMap."
-      : "Dijkstra lokal belum aktif karena graph OSM lokal belum tersedia; rute mengikuti jalan via fallback OSRM.";
     setResult(`
       <div class="badge-row">
         <span class="badge-algo">${escapeHtml(data.algorithm)}</span>
-        <span class="badge-algo">${escapeHtml(data.algorithm === "Dijkstra" ? "Dijkstra Lokal" : "Rute Jalan")}</span>
+        <span class="badge-algo">${escapeHtml(routingModeLabel(data))}</span>
         <span class="badge-algo">${escapeHtml(did.toUpperCase())}</span>
       </div>
       <h3 class="recommendation-title">${escapeHtml(m.name || "Masjid")}</h3>
@@ -623,13 +850,13 @@ async function routeToNearestMosque(mosqueId) {
         <div class="stat-item">Node Rute: <strong>${escapeHtml(data.route_summary.route_nodes_count)}</strong></div>
         <div class="stat-item">Skor: <strong>${escapeHtml(data.route_summary.multi_objective_score)}</strong></div>
       </div>
-      <div class="mode-note ${data.algorithm === "Dijkstra" || data.algorithm === "A*" ? "success" : "warning"}">${escapeHtml(modeNote)}</div>
+      <div class="mode-note ${isLocalGraphRoute(data) ? "success" : "warning"}">${escapeHtml(routingModeNote(data))}</div>
       <p class="hint-text" style="color: var(--text-main); margin-bottom: 12px; font-weight: 500;">
         ${escapeHtml(data.route_summary.reason)}
       </p>
     `);
     switchTab("tab-result");
-    setRouteNotice(`Rute ke ${m.name || "masjid"} berhasil dibuat.`, "success");
+    setRouteNotice(`${routingModeLabel(data)} ke ${m.name || "masjid"} berhasil dibuat.`, isLocalGraphRoute(data) ? "success" : "warning");
   } catch (err) {
     setRouteNotice(err.message, "error");
   } finally {
@@ -669,6 +896,7 @@ map.on("click", (e) => {
     clearNearestMosques("Memuat rekomendasi masjid terdekat...");
     setRouteNotice(describePointState(), endMarker ? "success" : "");
     setStatus(`Koordinat Awal: ${latlng.lat.toFixed(5)}, ${latlng.lng.toFixed(5)}`);
+    persistUiState({ start: markerState(startMarker) });
     loadNearestMosques();
   } else if (mode === "end") {
     if (endMarker) endMarker.remove();
@@ -681,6 +909,7 @@ map.on("click", (e) => {
     clearRouteArtifacts();
     setRouteNotice(describePointState(), startMarker ? "success" : "");
     setStatus(`Koordinat Tujuan: ${latlng.lat.toFixed(5)}, ${latlng.lng.toFixed(5)}`);
+    persistUiState({ end: markerState(endMarker) });
   }
   mode = null;
 });
@@ -764,26 +993,27 @@ document.getElementById("btnRoute").onclick = async () => {
     setLoading("btnRoute", true, originalText);
     setRouteNotice(
       payload.auto_build_osm
-        ? "Mengunduh/membangun graph OSM lalu menghitung rute. Mohon tunggu..."
-        : "Mengambil kandidat dari SQLite lalu mencoba rute jalan OSRM...",
+        ? "Mencoba cache/auto-build cepat; jika area terlalu besar akan fallback ke OSRM."
+        : "Mengambil kandidat dari SQLite lalu menghitung rute jalan OSRM...",
       "loading"
     );
     setStatus(
       payload.auto_build_osm
-        ? "Mengunduh/membangun graph OSM lalu menghitung rute. Proses ini bisa memakan waktu beberapa menit..."
+        ? "Mencoba Dijkstra lokal jika cache cocok. Area besar akan langsung dialihkan ke OSRM agar tidak loading lama..."
         : "Mengambil kandidat masjid dari SQLite dan menghitung rute jalan via OSRM..."
     );
     
-    const data = await api("/api/route", { method: "POST", timeoutMs: 180000, body: JSON.stringify(payload) });
+    const data = await api("/api/route", { method: "POST", timeoutMs: 60000, body: JSON.stringify(payload) });
     
     // Gambar ulang rute ke peta Leaflet
     if (!data.route_geojson?.geometry?.coordinates?.length) {
       throw new Error("Backend tidak mengembalikan geometri rute yang valid.");
     }
     clearRouteArtifacts();
+    saveLastRoute(data, did);
     routeLayer = L.geoJSON(data.route_geojson, {
       style: {
-        color: "#7c3aed",
+        color: routeLineColor(data),
         weight: 6,
         opacity: 0.85
       }
@@ -826,26 +1056,22 @@ document.getElementById("btnRoute").onclick = async () => {
         </div>
       `;
     }
-    const networkLabel = data.algorithm === "Local Approximation"
-      ? "Rute Lokal"
-      : data.algorithm === "OSRM Road Route"
-        ? "Rute Jalan"
-        : "OpenStreetMap";
-    const routingModeNote = data.algorithm === "OSRM Road Route"
+    const networkLabel = routingModeLabel(data);
+    const routingModeNoteHtml = data.algorithm === "OSRM Road Route"
       ? `
         <div class="mode-note warning">
-          Mode OSRM fallback aktif. Rute mengikuti jalan, tetapi Dijkstra lokal belum berjalan karena graph OSM lokal belum tersedia.
+          ${escapeHtml(routingModeNote(data))}
         </div>
       `
       : data.algorithm === "Local Approximation"
         ? `
           <div class="mode-note warning">
-            Mode rute lokal perkiraan aktif. Dijkstra lokal belum berjalan karena graph OSM lokal belum tersedia.
+            ${escapeHtml(routingModeNote(data))}
           </div>
         `
         : `
           <div class="mode-note success">
-            Dijkstra/A* lokal aktif pada graph jalan OpenStreetMap.
+            ${escapeHtml(routingModeNote(data))}
           </div>
         `;
 
@@ -873,7 +1099,7 @@ document.getElementById("btnRoute").onclick = async () => {
       <p class="hint-text" style="color: var(--text-main); margin-bottom: 12px; font-weight: 500;">
         ${escapeHtml(data.route_summary.reason)}
       </p>
-      ${routingModeNote}
+      ${routingModeNoteHtml}
       
       <p style="font-size: 10px; color: var(--text-light); border-top: 1px solid var(--border-color); padding-top: 8px;">
         Kualitas Data: Rating=${escapeHtml(m.data_quality?.rating_source || "unknown")}, Fasilitas=${escapeHtml(m.data_quality?.facilities_source || "unknown")}, Kapasitas=${escapeHtml(m.data_quality?.capacity_source || "unknown")}
@@ -884,8 +1110,8 @@ document.getElementById("btnRoute").onclick = async () => {
     // Alihkan tab sidebar secara otomatis ke "Hasil" agar user langsung melihat rekomendasi
     switchTab("tab-result");
     
-    setRouteNotice("Rute berhasil dibuat. Detail rekomendasi tersedia di tab Hasil.", "success");
-    setStatus(`Rute safar sukses dibuat. Mengevaluasi ${data.candidate_count} masjid alternatif.`);
+    setRouteNotice(`${routingModeLabel(data)} berhasil dibuat. Detail rekomendasi tersedia di tab Hasil.`, isLocalGraphRoute(data) ? "success" : "warning");
+    setStatus(`${routingModeLabel(data)} selesai. Mengevaluasi ${data.candidate_count} masjid alternatif.`);
   } catch (err) {
     setRouteNotice(err.message, "error");
     setStatus(`Gagal menghitung rute optimal:\n${err.message}`);
@@ -902,13 +1128,40 @@ document.getElementById("btnUseDataset").onclick = () => activateSelectedDataset
 document.getElementById("btnRunPipeline").onclick = runPipelineForSelected;
 document.getElementById("btnUploadDataset").onclick = uploadDataset;
 
+const datasetFileInput = document.getElementById("datasetFile");
+const fileNameDisplay = document.getElementById("fileNameDisplay");
+if (datasetFileInput && fileNameDisplay) {
+  datasetFileInput.addEventListener("change", () => {
+    if (datasetFileInput.files && datasetFileInput.files.length > 0) {
+      fileNameDisplay.textContent = datasetFileInput.files[0].name;
+    } else {
+      fileNameDisplay.textContent = "Pilih Berkas CSV";
+    }
+  });
+}
+
 datasetSelect.onchange = () => {
   const item = datasets.find(d => d.dataset_id === selectedDatasetId());
   datasetInfo.textContent = item ? describeDataset(item) : "Dataset terpilih belum dikenali.";
+  persistUiState({ dataset_id: selectedDatasetId() });
 };
+
+["algorithm", "currentTime", "prayerTime", "maxCandidates", "bufferKm", "autoBuild"].forEach(id => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener("change", () => persistUiState());
+  el.addEventListener("input", () => persistUiState());
+});
+
+map.on("moveend", () => persistUiState());
 
 // Inisialisasi Awal
 (async function init() {
   await refreshDatasets();
+  restoreUiState();
+  restoreLastRoute();
+  if (startMarker && !readUiState().last_route) {
+    loadNearestMosques();
+  }
   await refreshStatus();
 })();

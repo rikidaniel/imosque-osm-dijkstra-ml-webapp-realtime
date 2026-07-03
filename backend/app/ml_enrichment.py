@@ -56,6 +56,26 @@ PROVINCE_BOUNDS = {
     "DAERAH ISTIMEWA YOGYAKARTA": {"south": -8.25, "north": -7.45, "west": 109.95, "east": 110.95},
 }
 
+PROVINCE_ADDRESS_EXCLUSION_PATTERNS = {
+    # The raw Jawa Barat sheet can contain border-area geocoder results from
+    # Banten/Tangerang. Coordinate bounds alone are too coarse around Bogor.
+    "JAWA BARAT": [
+        r"\bBanten\b",
+        r"\bTangerang\b",
+        r"\bSouth Tangerang\b",
+        r"\bSerang\b",
+        r"\bCilegon\b",
+        r"\bPandeglang\b",
+        r"\bLebak\b",
+    ],
+    "BANTEN": [
+        r"\bJawa Barat\b",
+        r"\bWest Java\b",
+        r"\bDKI Jakarta\b",
+        r"\bJakarta\b",
+    ],
+}
+
 FACILITY_LABELS = [
     "parking",
     "wudu_area",
@@ -191,6 +211,44 @@ def _dataset_specific_bounds(df: pd.DataFrame) -> Dict[str, float] | None:
     return PROVINCE_BOUNDS.get(province)
 
 
+def _dataset_province(df: pd.DataFrame) -> str | None:
+    if "provinsi" not in df.columns:
+        return None
+    values = df["provinsi"].dropna().astype(str).str.upper().str.strip()
+    if values.empty:
+        return None
+    return str(values.mode().iloc[0])
+
+
+def _remove_cross_province_address_matches(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    province = _dataset_province(df)
+    patterns = PROVINCE_ADDRESS_EXCLUSION_PATTERNS.get(province or "")
+    if not patterns or "address" not in df.columns:
+        return df, 0
+    address = df["address"].fillna("").astype(str)
+    name = df["name"].fillna("").astype(str) if "name" in df.columns else ""
+    mask = address.str.contains("|".join(patterns), case=False, regex=True, na=False)
+    if province == "JAWA BARAT" and {"latitude", "longitude"}.issubset(df.columns):
+        bsd_area = (
+            df["latitude"].between(-6.45, -6.20)
+            & df["longitude"].between(106.45, 106.75)
+        )
+        bsd_terms = r"\b(?:Tangerang|Banten|BSD|Bsd|Serpong|Cisauk|Alam Sutera|Gading Serpong|Karawaci|Lippo Village)\b"
+        mask = mask | (bsd_area & (address.str.contains(bsd_terms, case=False, regex=True, na=False) | name.str.contains(bsd_terms, case=False, regex=True, na=False)))
+        jakarta_area = (
+            df["latitude"].between(-6.35, -5.95)
+            & df["longitude"].between(106.70, 106.95)
+        )
+        mask = mask | (jakarta_area & address.str.contains(r"\bJakarta\b", case=False, regex=True, na=False))
+        if "kabko" in df.columns:
+            kabko = df["kabko"].fillna("").astype(str).str.upper().str.strip()
+            mask = mask | (jakarta_area & ~kabko.isin({"BEKASI", "KOTA BEKASI"}))
+    removed = int(mask.sum())
+    if removed == 0:
+        return df, 0
+    return df[~mask].copy(), removed
+
+
 def _apply_robust_coordinate_filter(df: pd.DataFrame) -> pd.DataFrame:
     if len(df) < 50:
         return df
@@ -202,6 +260,29 @@ def _apply_robust_coordinate_filter(df: pd.DataFrame) -> pd.DataFrame:
         df["latitude"].between(lat_q1 - lat_pad, lat_q3 + lat_pad)
         & df["longitude"].between(lon_q1 - lon_pad, lon_q3 + lon_pad)
     ].copy()
+
+
+def _remove_non_mosque_records(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    name = df["name"].fillna("").astype(str)
+    address = df["address"].fillna("").astype(str)
+    mosque_type = df["mosque_type"].fillna("").astype(str).str.lower()
+    text = (name + " " + address).str.lower()
+    explicit_mosque = text.str.contains(
+        r"\b(?:masjid|mesjid|mosque|mushola|musholla|musala|langgar|surau)\b",
+        regex=True,
+        na=False,
+    )
+    non_mosque_place = text.str.contains(
+        r"\b(?:school|primary school|educational institution|clinic|hospital|tourist attraction|non-profit organization|cultural center|camp|restaurant|hotel|store)\b",
+        regex=True,
+        na=False,
+    )
+    mosque_type_ok = mosque_type.str.contains(r"\bmasjid\b|islamic_center", regex=True, na=False)
+    keep = explicit_mosque | (mosque_type_ok & ~non_mosque_place)
+    removed = int((~keep).sum())
+    if removed == 0:
+        return df, 0
+    return df[keep].copy(), removed
 
 def _read_csv_flexible(raw_csv: Path) -> pd.DataFrame:
     try:
@@ -312,7 +393,12 @@ def load_and_clean(raw_csv: Path | None = None, dataset_id: str | None = None) -
             df["latitude"].between(bounds["south"], bounds["north"])
             & df["longitude"].between(bounds["west"], bounds["east"])
         ].copy()
-        coordinate_filter_note = f"province_bounds_filter_removed_{before_bounds - len(df)}"
+        removed_by_bounds = before_bounds - len(df)
+        df, removed_by_address = _remove_cross_province_address_matches(df)
+        coordinate_filter_note = (
+            f"province_bounds_filter_removed_{removed_by_bounds};"
+            f"cross_province_address_filter_removed_{removed_by_address}"
+        )
     else:
         before_bounds = len(df)
         df = _apply_robust_coordinate_filter(df)
@@ -330,6 +416,8 @@ def load_and_clean(raw_csv: Path | None = None, dataset_id: str | None = None) -
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str).str.strip()
+
+    df, removed_non_mosque = _remove_non_mosque_records(df)
 
     df["facilities_list_original"] = df["facilities"].map(_split_facilities)
     df["has_original_facilities"] = df["facilities_list_original"].map(lambda x: len(x) > 0)
@@ -351,6 +439,7 @@ def load_and_clean(raw_csv: Path | None = None, dataset_id: str | None = None) -
         "valid_coordinate_rows": int(len(df)),
         "removed_rows_by_coordinate_or_duplicate": int(len(df_raw) - len(df)),
         "coordinate_filter_note": coordinate_filter_note,
+        "non_mosque_filter_removed": removed_non_mosque,
         "original_rating_available": int(df["has_original_rating"].sum()),
         "original_facilities_available": int(df["has_original_facilities"].sum()),
         "bbox": bbox,
@@ -365,6 +454,7 @@ def enrich_dataset(
     raw_csv: Path | None = None,
     out_json: Path | None = None,
     profile_json: Path | None = None,
+    make_active: bool = False,
 ) -> Dict[str, Any]:
     ensure_default_dataset()
     did = slugify_dataset_name(dataset_id or get_active_dataset_id() or DEFAULT_DATASET_ID)
@@ -524,7 +614,8 @@ def enrich_dataset(
         raw_csv_path=str(raw_csv),
         enriched_json_path=str(out_json),
     )
-    set_active_dataset_id(did)
+    if make_active:
+        set_active_dataset_id(did)
     return profile
 
 

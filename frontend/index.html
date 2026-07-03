@@ -12,7 +12,7 @@
   <!-- Leaflet CSS -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <!-- Custom Stylesheet -->
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=tier-colors-20260703" />
 </head>
 <body>
   <div class="app-container">
@@ -75,10 +75,10 @@
               <div class="form-group">
                 <div class="file-upload-card">
                   <input id="datasetFile" type="file" accept=".csv" class="file-input" />
-                  <div class="file-upload-label">
+                  <label for="datasetFile" class="file-upload-label">
                     <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
-                    <span>Pilih Berkas CSV</span>
-                  </div>
+                    <span id="fileNameDisplay">Pilih Berkas CSV</span>
+                  </label>
                 </div>
               </div>
 
@@ -151,7 +151,7 @@
 
               <div class="form-group checkbox-group">
                 <input id="autoBuild" type="checkbox" />
-                <label for="autoBuild">Coba bangun graph OSM jika cache lokal sudah ada</label>
+                <label for="autoBuild">Auto-build graph OSM untuk area kecil saja</label>
               </div>
 
               <button id="btnRoute" class="btn btn-primary btn-large">Cari Rute Teroptimal</button>
@@ -213,6 +213,6 @@
   <!-- Leaflet JS -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <!-- Custom Application Script -->
-  <script src="app.js?v=nearest-mosque-route"></script>
+  <script src="app.js?v=tier-colors-20260703"></script>
 </body>
 </html>

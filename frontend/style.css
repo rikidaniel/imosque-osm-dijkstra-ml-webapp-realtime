@@ -816,10 +816,10 @@ body {
   text-transform: uppercase;
 }
 
-.badge-tier.tier-a { background-color: #dcfce7; color: #15803d; }
-.badge-tier.tier-b { background-color: #ccfbf1; color: #0f766e; }
-.badge-tier.tier-c { background-color: #fef3c7; color: #b45309; }
-.badge-tier.tier-d { background-color: #f1f5f9; color: #475569; }
+.badge-tier.tier-a { background-color: #dbeafe; color: #1d4ed8; }
+.badge-tier.tier-b { background-color: #ede9fe; color: #6d28d9; }
+.badge-tier.tier-c { background-color: #ffedd5; color: #c2410c; }
+.badge-tier.tier-d { background-color: #e2e8f0; color: #334155; }
 
 .badge-algo {
   background-color: #e0f2fe;
@@ -981,10 +981,10 @@ body {
   flex-shrink: 0;
 }
 
-.legend-color.tier-a { background-color: #2d6a4f; }
-.legend-color.tier-b { background-color: #52b788; }
-.legend-color.tier-c { background-color: #f59e0b; }
-.legend-color.tier-d { background-color: #64748b; }
+.legend-color.tier-a { background-color: #2563eb; }
+.legend-color.tier-b { background-color: #7c3aed; }
+.legend-color.tier-c { background-color: #f97316; }
+.legend-color.tier-d { background-color: #334155; }
 
 .legend-label {
   font-size: 11px;

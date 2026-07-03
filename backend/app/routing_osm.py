@@ -14,6 +14,8 @@ from .ml_enrichment import load_enriched_mosques
 from .osm_graph import (
     DEFAULT_GRAPHML,
     astar_path,
+    bbox_area_km2,
+    bbox_from_points,
     build_osm_graph_for_route,
     graph_bounds,
     graph_covers_points,
@@ -28,6 +30,7 @@ from .osm_graph import (
 
 Coordinate = Tuple[float, float]
 OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving"
+MAX_INLINE_AUTO_BUILD_AREA_KM2 = 90.0
 
 
 def _parse_hhmm(value: Optional[str]) -> Optional[dt.datetime]:
@@ -63,6 +66,7 @@ def select_candidate_mosques(
     end: Coordinate,
     limit: int = 8,
     corridor_km: float = 8.0,
+    fallback_radius_km: float = 50.0,
 ) -> List[Dict[str, Any]]:
     scored: List[Tuple[float, Dict[str, Any]]] = []
     min_lat, max_lat = sorted([start[0], end[0]])
@@ -84,10 +88,12 @@ def select_candidate_mosques(
         scored.append((rank_score, m))
 
     if not scored:
-        # Fallback: nearest mosque to start if corridor has no candidates.
+        # Fallback: nearest mosque to start, but keep it inside a reasonable
+        # dataset radius so wrong-region selections do not look authoritative.
         for m in mosques:
             d_start = haversine_km(start[0], start[1], float(m["latitude"]), float(m["longitude"]))
-            scored.append((d_start, m))
+            if d_start <= fallback_radius_km:
+                scored.append((d_start, m))
 
     scored.sort(key=lambda x: x[0])
     return [m for _, m in scored[:limit]]
@@ -106,6 +112,18 @@ def _normalise_values(values: List[float]) -> List[float]:
     if hi == lo:
         return [0.0 for _ in values]
     return [(v - lo) / (hi - lo) for v in values]
+
+
+def _inline_auto_build_skip_note(points: Sequence[Coordinate], buffer_km: float) -> Optional[str]:
+    north, south, east, west = bbox_from_points(points, buffer_km=buffer_km)
+    area_km2 = bbox_area_km2(north, south, east, west)
+    if area_km2 <= MAX_INLINE_AUTO_BUILD_AREA_KM2:
+        return None
+    return (
+        "Auto-build graph dilewati agar tombol Cari Rute tidak loading terlalu lama "
+        f"(estimasi area {area_km2:.0f} km2, batas route cepat {MAX_INLINE_AUTO_BUILD_AREA_KM2:.0f} km2). "
+        "Gunakan tombol Bangun Graph OSM Manual untuk membuat cache Dijkstra lokal area ini."
+    )
 
 
 def _prayer_penalty(arrival_minutes: float, current_time: Optional[str], prayer_time: Optional[str]) -> float:
@@ -160,10 +178,17 @@ def _format_route_response(
     results.sort(key=lambda x: x["multi_objective_score"])
     best = results[0]
     best_m = best["mosque"]
+    used_osrm_fallback = algorithm_label == "OSRM Road Route"
+    is_local_approximation = algorithm_label == "Local Approximation"
+    routing_mode = "osrm_fallback" if used_osrm_fallback else "local_approximation" if is_local_approximation else "local_graph"
+    graph_source = "osrm_public_api" if used_osrm_fallback else "none" if is_local_approximation else "osm_graphml_cache"
 
     return {
         "algorithm": algorithm_label,
         "dataset_id": dataset_id,
+        "routing_mode": routing_mode,
+        "graph_source": graph_source,
+        "used_osrm_fallback": used_osrm_fallback,
         "road_network": road_network,
         "routing_weight": routing_weight,
         "candidate_count": len(results),
@@ -464,7 +489,8 @@ def route_to_mosque(
     if start == mosque_point:
         raise ValueError("Titik awal dan masjid tujuan tidak boleh sama.")
 
-    if not graphml_path.exists():
+    G = None
+    if not graphml_path.exists() and not auto_build_osm:
         return _route_via_osrm_fallback(
             start=start,
             end=mosque_point,
@@ -482,12 +508,28 @@ def route_to_mosque(
 
     if auto_build_osm:
         try:
-            G = load_road_graph(graphml_path)
-            cache_ready = graph_covers_points(G, [start, mosque_point], margin_km=0.5)
+            G = load_road_graph(graphml_path) if graphml_path.exists() else None
+            cache_ready = G is not None and graph_covers_points(G, [start, mosque_point], margin_km=0.5)
         except FileNotFoundError:
             G = None
             cache_ready = False
         if not cache_ready:
+            skip_note = _inline_auto_build_skip_note([start, mosque_point], max(float(buffer_km), 5.0))
+            if skip_note:
+                return _route_via_osrm_fallback(
+                    start=start,
+                    end=mosque_point,
+                    candidates=[mosque],
+                    requested_candidates=requested_candidates,
+                    current_time=None,
+                    prayer_time=None,
+                    dataset_id=dataset_id,
+                    start_lat=start_lat,
+                    start_lon=start_lon,
+                    end_lat=mosque_point[0],
+                    end_lon=mosque_point[1],
+                    fallback_note=skip_note,
+                )
             try:
                 G = build_osm_graph_for_route(
                     start_lat=start_lat,
@@ -626,7 +668,13 @@ def route_via_osm_dijkstra(
         end,
         limit=evaluation_limit,
         corridor_km=effective_corridor_km,
+        fallback_radius_km=max(25.0, effective_corridor_km * 4),
     )
+    if not candidates:
+        raise ValueError(
+            "Tidak ada kandidat masjid yang masuk koridor/radius pencarian. "
+            "Pastikan dataset aktif sesuai wilayah titik awal dan tujuan, atau perbesar Buffer OSM."
+        )
     build_candidate_limit = min(len(candidates), max(requested_candidates, 3))
     build_candidate_points = [
         (float(m["latitude"]), float(m["longitude"]))
@@ -634,7 +682,8 @@ def route_via_osm_dijkstra(
     ]
     points_to_cover = [start, end] + build_candidate_points
 
-    if not graphml_path.exists():
+    G = None
+    if not graphml_path.exists() and not auto_build_osm:
         return _route_via_osrm_fallback(
             start=start,
             end=end,
@@ -654,13 +703,29 @@ def route_via_osm_dijkstra(
         # Reuse a matching cache. Rebuilding on every click makes routing feel
         # stuck because OSMnx must query Overpass and simplify a fresh graph.
         try:
-            G = load_road_graph(graphml_path)
-            cache_ready = graph_covers_points(G, points_to_cover, margin_km=0.5)
+            G = load_road_graph(graphml_path) if graphml_path.exists() else None
+            cache_ready = G is not None and graph_covers_points(G, points_to_cover, margin_km=0.5)
         except FileNotFoundError:
             G = None
             cache_ready = False
 
         if not cache_ready:
+            skip_note = _inline_auto_build_skip_note(points_to_cover, effective_corridor_km)
+            if skip_note:
+                return _route_via_osrm_fallback(
+                    start=start,
+                    end=end,
+                    candidates=candidates,
+                    requested_candidates=requested_candidates,
+                    current_time=current_time,
+                    prayer_time=prayer_time,
+                    dataset_id=dataset_id,
+                    start_lat=start_lat,
+                    start_lon=start_lon,
+                    end_lat=end_lat,
+                    end_lon=end_lon,
+                    fallback_note=skip_note,
+                )
             try:
                 G = build_osm_graph_for_route(
                     start_lat=start_lat,

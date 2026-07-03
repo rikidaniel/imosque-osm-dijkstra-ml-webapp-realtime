@@ -89,7 +89,7 @@ def set_active_dataset(dataset_id: str = Form(...)) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Dataset tidak ditemukan: {did}")
     set_active_dataset_id(did)
     if not local_db.dataset_has_mosques(did) and not paths["enriched_json"].exists():
-        enrich_dataset(did)
+        enrich_dataset(did, make_active=True)
     elif not local_db.dataset_has_mosques(did):
         load_enriched_mosques(dataset_id=did)
     return {
@@ -113,7 +113,7 @@ async def upload_dataset(
     saved = save_uploaded_dataset(content, filename=filename, dataset_name=dataset_name, make_active=make_active)
     profile = None
     if process_now:
-        profile = enrich_dataset(saved["dataset_id"])
+        profile = enrich_dataset(saved["dataset_id"], make_active=make_active)
     return {
         "status": "success",
         **saved,
@@ -124,7 +124,7 @@ async def upload_dataset(
 
 @app.post("/api/pipeline/run")
 def run_pipeline(dataset_id: str | None = Query(None)) -> Dict[str, Any]:
-    return enrich_dataset(dataset_id=dataset_id)
+    return enrich_dataset(dataset_id=dataset_id, make_active=False)
 
 
 @app.get("/api/profile")

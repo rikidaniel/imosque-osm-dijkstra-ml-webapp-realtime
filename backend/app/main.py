@@ -43,6 +43,18 @@ app.add_middleware(
 )
 
 
+def _friendly_error(exc: Exception) -> str:
+    message = str(exc)
+    lowered = message.lower()
+    if "overpass" in lowered or "httpsconnectionpool" in lowered or "max retries exceeded" in lowered or "timed out" in lowered:
+        return (
+            "Overpass/OSM sedang lambat atau tidak merespons, jadi graph Dijkstra lokal belum berhasil dibuat. "
+            "Rute tetap bisa dicari dengan OSRM fallback. Coba lagi nanti, kecilkan Buffer OSM ke 1-2 km, "
+            "atau pilih start-tujuan yang lebih dekat."
+        )
+    return message
+
+
 def _profile_for(dataset_id: str) -> Dict[str, Any] | None:
     db_profile = local_db.get_dataset_profile(dataset_id)
     if db_profile:
@@ -231,7 +243,7 @@ def route_selected_mosque(req: RouteToMosqueRequest) -> Dict[str, Any]:
             dataset_id=did,
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
 
 @app.post("/api/osm/build-bbox")
@@ -261,7 +273,7 @@ def build_osm_bbox(req: BuildOsmRequest) -> Dict[str, Any]:
             "network_type": req.network_type,
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
 
 @app.post("/api/osm/build-route")
@@ -293,7 +305,7 @@ def build_osm_route(req: BuildOsmRouteRequest) -> Dict[str, Any]:
             "network_type": req.network_type,
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
 
 @app.post("/api/route")
@@ -322,4 +334,4 @@ def route(req: RouteRequest) -> Dict[str, Any]:
             ),
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=_friendly_error(exc))

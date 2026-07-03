@@ -11,6 +11,12 @@ DATA_DIR = PROJECT_DIR / "data"
 OSM_CACHE_DIR = DATA_DIR / "osm_cache"
 DEFAULT_GRAPHML = OSM_CACHE_DIR / "road_graph_latest.graphml"
 MAX_OSM_BUILD_AREA_KM2 = 1200.0
+OVERPASS_REQUEST_TIMEOUT_SECONDS = 45
+OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api",
+    "https://overpass.kumi.systems/api",
+    "https://overpass.osm.ch/api",
+)
 
 Coordinate = Tuple[float, float]  # lat, lon
 
@@ -59,6 +65,54 @@ def _validate_bbox_size(north: float, south: float, east: float, west: float) ->
         )
 
 
+def _graph_from_bbox_compat(ox, north: float, south: float, east: float, west: float, network_type: str):
+    try:
+        return ox.graph_from_bbox(north, south, east, west, network_type=network_type, simplify=True)
+    except TypeError:
+        return ox.graph_from_bbox(bbox=(west, south, east, north), network_type=network_type, simplify=True)
+
+
+def _summarize_overpass_error(exc: Exception) -> str:
+    message = str(exc)
+    lowered = message.lower()
+    if "timed out" in lowered or "timeout" in lowered:
+        return "timeout"
+    if "max retries exceeded" in lowered or "connection" in lowered:
+        return "koneksi gagal"
+    if "too many requests" in lowered or "429" in lowered:
+        return "rate limit"
+    if "504" in lowered or "gateway" in lowered:
+        return "gateway timeout"
+    return message[:120]
+
+
+def _download_graph_from_overpass(ox, north: float, south: float, east: float, west: float, network_type: str):
+    old_url = getattr(ox.settings, "overpass_url", None)
+    old_timeout = getattr(ox.settings, "requests_timeout", None)
+    failures: List[str] = []
+    last_exc: Exception | None = None
+    try:
+        for endpoint in OVERPASS_ENDPOINTS:
+            try:
+                ox.settings.overpass_url = endpoint
+                ox.settings.requests_timeout = OVERPASS_REQUEST_TIMEOUT_SECONDS
+                return _graph_from_bbox_compat(ox, north, south, east, west, network_type)
+            except Exception as exc:
+                last_exc = exc
+                failures.append(f"{endpoint.replace('https://', '')}: {_summarize_overpass_error(exc)}")
+        raise RuntimeError(
+            "Overpass API sedang lambat/tidak merespons, jadi graph Dijkstra lokal belum bisa dibuat. "
+            "Rute tetap bisa memakai OSRM tanpa build graph. Coba lagi nanti, kecilkan Buffer OSM, "
+            "atau pilih start-tujuan yang lebih dekat. Endpoint dicoba: "
+            + "; ".join(failures)
+        ) from last_exc
+    finally:
+        if old_url is not None:
+            ox.settings.overpass_url = old_url
+        if old_timeout is not None:
+            ox.settings.requests_timeout = old_timeout
+
+
 def build_osm_graph_for_bbox(
     north: float,
     south: float,
@@ -75,11 +129,7 @@ def build_osm_graph_for_bbox(
     ox = _require_osmnx()
     OSM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # OSMnx 1.x and 2.x have different graph_from_bbox signatures.
-    try:
-        G = ox.graph_from_bbox(north, south, east, west, network_type=network_type, simplify=True)
-    except TypeError:
-        G = ox.graph_from_bbox(bbox=(west, south, east, north), network_type=network_type, simplify=True)
+    G = _download_graph_from_overpass(ox, north, south, east, west, network_type)
 
     # Add travel-time weights if possible. If speeds cannot be inferred, length remains available.
     try:

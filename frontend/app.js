@@ -385,6 +385,14 @@ function parseApiResponseText(text) {
   }
 }
 
+function apiErrorMessage(data, text, status) {
+  const detail = data?.detail;
+  if (typeof detail === "string") return detail;
+  if (detail?.message) return detail.message;
+  if (Array.isArray(detail)) return detail.map(item => item.msg || item.message || String(item)).join("; ");
+  return text || `HTTP ${status}`;
+}
+
 async function api(path, options = {}) {
   const { timeoutMs = 120000, ...fetchOptions } = options;
   const controller = new AbortController();
@@ -402,7 +410,7 @@ async function api(path, options = {}) {
     });
     const text = await res.text();
     const data = parseApiResponseText(text);
-    if (!res.ok) throw new Error(data.detail || text || `HTTP ${res.status}`);
+    if (!res.ok) throw new Error(apiErrorMessage(data, text, res.status));
     return data;
   } finally {
     clearTimeout(timeoutId);
@@ -416,7 +424,7 @@ async function apiForm(path, formData) {
   });
   const text = await res.text();
   const data = parseApiResponseText(text);
-  if (!res.ok) throw new Error(data.detail || text || `HTTP ${res.status}`);
+  if (!res.ok) throw new Error(apiErrorMessage(data, text, res.status));
   return data;
 }
 
@@ -932,8 +940,8 @@ document.getElementById("btnBuildOsm").onclick = async () => {
     const bufferKm = Number(document.getElementById("bufferKm").value || 6);
     
     setLoading("btnBuildOsm", true, originalText);
-    setRouteNotice("Membangun graph OSM dari titik awal dan tujuan. Ini bisa memakan waktu saat pertama kali.", "loading");
-    setStatus("Membangun OSM road graph. Harap tunggu, kueri Overpass API sedang dikirim...");
+    setRouteNotice("Membangun graph OSM lokal. Jika Overpass lambat, proses akan berhenti dengan pesan singkat.", "loading");
+    setStatus("Membangun OSM road graph. Backend mencoba beberapa endpoint Overpass...");
     
     const data = await api("/api/osm/build-route", {
       method: "POST",

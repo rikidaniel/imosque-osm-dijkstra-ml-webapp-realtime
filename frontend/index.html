@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>iMosque Safar Mode - OSM Dijkstra Routing</title>
+  <!-- Google Fonts: Plus Jakarta Sans -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <!-- Custom Stylesheet -->
+  <link rel="stylesheet" href="style.css?v=tier-colors-20260703" />
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="header-brand">
+        <svg class="brand-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 20h18"/><path d="M5 20v-6a7 7 0 0 1 14 0v6"/><path d="M8 20v-5a4 4 0 0 1 8 0v5"/><path d="M12 3v5"/><path d="m12 3 3 3"/><path d="m12 3-3 3"/></svg>
+        <div class="brand-text">
+          <h1>iMosque</h1>
+          <p>Safar Mode Routing & ML Enrichment</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="btnToggleSidebar" class="header-btn" title="Toggle Sidebar">
+          <svg id="toggleIcon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="main-layout">
+      <!-- Collapsible Sidebar Panel -->
+      <aside id="sidebar" class="sidebar-panel">
+        <!-- Navigation Tabs -->
+        <div class="tabs-nav">
+          <button class="tab-btn active" data-tab="tab-dataset">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"/><path d="M12 6v6l4 2"/></svg>
+            Dataset
+          </button>
+          <button class="tab-btn" data-tab="tab-routing">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m20 12-8-8-8 8M4 12V20a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V12"/></svg>
+            Rute
+          </button>
+          <button class="tab-btn" data-tab="tab-result">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+            Hasil
+          </button>
+        </div>
+
+        <div class="tabs-content">
+          <!-- Tab 1: Dataset Management -->
+          <div id="tab-dataset" class="tab-panel active">
+            <div class="panel-section">
+              <h2 class="section-title">Dataset Aktif</h2>
+              <div class="inline-row">
+                <select id="datasetSelect" class="form-select"></select>
+                <button id="btnRefreshDatasets" class="icon-btn" title="Refresh list dataset">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                </button>
+              </div>
+
+              <div class="button-row">
+                <button id="btnUseDataset" class="btn btn-secondary">Gunakan</button>
+                <button id="btnRunPipeline" class="btn btn-secondary">Proses ML Ulang</button>
+              </div>
+            </div>
+
+            <div class="panel-section">
+              <h2 class="section-title">Unggah Dataset Baru</h2>
+              <p class="hint-text">Format file berupa CSV dengan kolom wajib: <code>name</code>, <code>latitude</code>, dan <code>longitude</code>.</p>
+              
+              <div class="form-group">
+                <div class="file-upload-card">
+                  <input id="datasetFile" type="file" accept=".csv" class="file-input" />
+                  <label for="datasetFile" class="file-upload-label">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+                    <span id="fileNameDisplay">Pilih Berkas CSV</span>
+                  </label>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <input id="datasetName" type="text" placeholder="Nama dataset baru (opsional)" class="form-input" />
+              </div>
+              <button id="btnUploadDataset" class="btn btn-primary">Upload & Jalankan ML</button>
+            </div>
+
+            <div class="panel-section">
+              <h2 class="section-title">Detail Informasi</h2>
+              <div id="datasetInfo" class="info-card">Memuat informasi dataset...</div>
+            </div>
+          </div>
+
+          <!-- Tab 2: Routing Controls -->
+          <div id="tab-routing" class="tab-panel">
+            <div class="panel-section">
+              <h2 class="section-title">Titik Perjalanan</h2>
+              <p class="hint-text">Aktifkan mode lalu klik posisi awal & akhir pada peta.</p>
+              <div class="button-row">
+                <button id="btnSetStart" class="btn btn-set-point btn-start">
+                  <span class="point-indicator"></span> Set Start
+                </button>
+                <button id="btnSetEnd" class="btn btn-set-point btn-end">
+                  <span class="point-indicator"></span> Set Tujuan
+                </button>
+              </div>
+              <div class="nearest-panel">
+                <div class="nearest-header">
+                  <span>Masjid Terdekat</span>
+                  <button id="btnFindNearest" class="btn-link" type="button">Cari</button>
+                </div>
+                <div id="nearestList" class="nearest-list empty">Pilih titik awal untuk melihat rekomendasi masjid terdekat.</div>
+              </div>
+            </div>
+
+            <div class="panel-section">
+              <h2 class="section-title">Parameter Safar</h2>
+              
+              <div class="form-group">
+                <label for="algorithm">Algoritma Routing</label>
+                <select id="algorithm" class="form-select">
+                  <option value="dijkstra" selected>Dijkstra (Multi-Objective)</option>
+                  <option value="astar">A* Search</option>
+                </select>
+              </div>
+
+              <div class="time-grid">
+                <div class="form-group">
+                  <label for="currentTime">Waktu Sekarang</label>
+                  <input id="currentTime" type="time" value="17:35" class="form-input" />
+                </div>
+                <div class="form-group">
+                  <label for="prayerTime">Waktu Shalat/Adzan</label>
+                  <input id="prayerTime" type="time" value="18:05" class="form-input" />
+                </div>
+              </div>
+
+              <div class="range-grid">
+                <div class="form-group">
+                  <label for="maxCandidates">Maks Kandidat Masjid</label>
+                  <input id="maxCandidates" type="number" value="6" min="1" max="20" class="form-input" />
+                </div>
+                <div class="form-group">
+                  <label for="bufferKm">Buffer OSM (km)</label>
+                  <input id="bufferKm" type="number" value="6" min="1" max="25" class="form-input" />
+                </div>
+              </div>
+
+              <div class="form-group checkbox-group">
+                <input id="autoBuild" type="checkbox" />
+                <label for="autoBuild">Auto-build graph OSM untuk area kecil saja</label>
+              </div>
+
+              <button id="btnRoute" class="btn btn-primary btn-large">Cari Rute Teroptimal</button>
+              <div id="routeNotice" class="route-notice">Pilih titik awal dan tujuan di peta sebelum mencari rute.</div>
+              <div class="extra-actions">
+                <button id="btnBuildOsm" class="btn-link">Bangun Graph OSM Manual</button>
+                <button id="btnLoadMosques" class="btn-link">Tampilkan Semua Masjid</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab 3: Results and Status -->
+          <div id="tab-result" class="tab-panel">
+            <div class="panel-section">
+              <h2 class="section-title">Status Server</h2>
+              <div id="status" class="status-card">Menunggu aksi...</div>
+            </div>
+
+            <div class="panel-section">
+              <h2 class="section-title">Masjid Rekomendasi Terpilih</h2>
+              <div id="result" class="result-card empty">Belum ada rute aktif. Silakan tentukan titik awal & tujuan di Tab Rute.</div>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Map Display Container -->
+      <section id="map" class="map-container">
+        <!-- Floating Map Legend -->
+        <div class="map-legend">
+          <h4 class="legend-title">Prioritas Masjid (Tier)</h4>
+          <div class="legend-items">
+            <div class="legend-item">
+              <span class="legend-color tier-a"></span>
+              <span class="legend-label">Tier A (Prioritas Utama)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color tier-b"></span>
+              <span class="legend-label">Tier B (Prioritas Tinggi)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color tier-c"></span>
+              <span class="legend-label">Tier C (Standar)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color tier-d"></span>
+              <span class="legend-label">Tier D (Minim Data)</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <footer class="app-footer">
+      <span>iMosque Safar Mode &copy; 2026. Data OpenStreetMap dan Estimasi AI/ML diperuntukkan untuk pendukung keputusan perjalanan safar secara realtime.</span>
+    </footer>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Custom Application Script -->
+  <script src="app.js?v=overpass-message-20260703"></script>
+</body>
+</html>

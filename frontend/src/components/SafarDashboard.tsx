@@ -1,11 +1,10 @@
 "use client";
 
 import { useEffect, useState, useMemo, useRef, useCallback } from "react";
+import dynamic from "next/dynamic";
 import { useAppStore } from "@/lib/store";
 import { formatDistance } from "@/lib/utils";
 import MapViewer from "@/components/map/MapViewer";
-import RouteResultPanel from "@/components/route/RouteResultPanel";
-import MosqueDetailDrawer from "@/components/map/MosqueDetailDrawer";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -15,12 +14,16 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
-import { fetchDatasets, fetchNearestMosques, routeToMosque, fetchMosques } from "@/lib/api";
+import { buildSelectedRouteCacheKey, fetchDatasets, fetchNearestMosques, fetchPrayerTimes, routeToMosque, fetchMosques } from "@/lib/api";
 import { 
   Search, Settings, Clock, Compass, Navigation, Star, RotateCcw, X, MapPin, 
   Locate, Bell, BellOff, Volume2, VolumeX, CheckCircle2, AlertTriangle, AlertCircle, Shield
 } from "lucide-react";
 import { useRouter } from "next/navigation";
+import { saveSettingsToDatabase } from "@/lib/settings-sync";
+
+const RouteResultPanel = dynamic(() => import("@/components/route/RouteResultPanel"), { ssr: false });
+const MosqueDetailDrawer = dynamic(() => import("@/components/map/MosqueDetailDrawer"), { ssr: false });
 
 const API_BASE = typeof window !== "undefined"
   ? `http://${window.location.hostname}:8000`
@@ -30,6 +33,34 @@ interface PrayerSchedule {
   name: string;
   time: string;
   isAlarmActive: boolean;
+}
+
+function decodePolyline(encoded: string): [number, number][] {
+  const points: [number, number][] = [];
+  let index = 0;
+  let lat = 0;
+  let lon = 0;
+  while (index < encoded.length) {
+    let result = 0;
+    let shift = 0;
+    let byte: number;
+    do {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20 && index < encoded.length);
+    lat += result & 1 ? ~(result >> 1) : result >> 1;
+    result = 0;
+    shift = 0;
+    do {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20 && index < encoded.length);
+    lon += result & 1 ? ~(result >> 1) : result >> 1;
+    points.push([lat / 1e5, lon / 1e5]);
+  }
+  return points;
 }
 
 export default function SafarDashboard() {
@@ -56,7 +87,10 @@ export default function SafarDashboard() {
     hijriDate,
     setHijriDate,
     masehiDate,
-    setMasehiDate
+    setMasehiDate,
+    prayerCacheKey,
+    setPrayerCacheKey,
+    settingsSyncStatus,
   } = useAppStore();
   
   const router = useRouter();
@@ -69,6 +103,9 @@ export default function SafarDashboard() {
   const [loading, setLoading] = useState(false);
   const [showLocationPopup, setShowLocationPopup] = useState(false);
   const [isGpsChecking, setIsGpsChecking] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [savingAlarmIndex, setSavingAlarmIndex] = useState<number | null>(null);
+  const [routingMosqueId, setRoutingMosqueId] = useState<string | null>(null);
 
   // Quick Filter States
   const [filterRating, setFilterRating] = useState(false);
@@ -88,32 +125,8 @@ export default function SafarDashboard() {
   // Sync Local Settings with Store once loaded + auto-migrate nilai lama
   useEffect(() => {
     const settings = { ...searchSettings };
-    // Auto-migrate: naikkan bufferKm dari nilai lama 10 ke 50
-    if (settings.bufferKm === "10") {
-      settings.bufferKm = "50";
-      setSearchSettings({ bufferKm: "50" });
-    }
     setLocalSettings(settings);
   }, [searchSettings, setSearchSettings]);
-
-  // Load alarm preferences from local storage on mount
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      const stored = localStorage.getItem("prayerAlarms");
-      if (stored) {
-        try {
-          const savedAlarms = JSON.parse(stored);
-          const current = useAppStore.getState().prayerSchedule || activeSchedule;
-          const updated = current.map((p: any, i: number) => ({
-            ...p,
-            isAlarmActive: savedAlarms[i] ?? p.isAlarmActive
-          }));
-          setPrayerSchedule(updated);
-        } catch (e) {}
-      }
-    }
-  }, [setPrayerSchedule]);
-
 
   // Load Datasets
   useEffect(() => {
@@ -166,7 +179,7 @@ export default function SafarDashboard() {
               console.warn("Silent GPS check failed:", error);
               setIsGpsChecking(false);
             },
-            { enableHighAccuracy: true, timeout: 6000 }
+            { enableHighAccuracy: false, maximumAge: 300000, timeout: 4000 }
           );
         }
       }).catch(err => {
@@ -180,23 +193,26 @@ export default function SafarDashboard() {
     if (isGpsChecking) return; // Tunggu hingga deteksi GPS selesai
 
     if (activeDatasetId) {
-      // Radius untuk TAMPILAN marker di peta: minimal 50km agar lintas wilayah terlihat
+      // Marker terdekat memakai radius hemat; backend memperluas 5 -> 15 km bila perlu.
       const settingRadius = parseFloat(searchSettings.bufferKm);
-      const radius = isNaN(settingRadius) ? 50 : Math.max(settingRadius, 50);
+      const radius = isNaN(settingRadius) ? 15 : Math.min(Math.max(settingRadius, 5), 15);
       // Limit tampilan sesuai dengan pengaturan Rekomendasi (maxCandidates)
       const limit = parseInt(searchSettings.maxCandidates) || 10;
       
       if (startPoint) {
+        const controller = new AbortController();
         console.log(`[fetchMosques] dataset=${activeDatasetId} lat=${startPoint.lat} lng=${startPoint.lng} radius=${radius}km limit=${limit}`);
-        fetchNearestMosques(activeDatasetId, startPoint.lat, startPoint.lng, radius, limit)
+        fetchNearestMosques(activeDatasetId, startPoint.lat, startPoint.lng, radius, limit, controller.signal)
           .then(res => {
             console.log(`[fetchMosques] response total=${res.total} items=${res.items?.length}`);
             setMosques(res.items || []);
           })
           .catch(err => {
+            if (err instanceof DOMException && err.name === "AbortError") return;
             console.error("Gagal mengambil masjid terdekat:", err);
             setMosques([]);
           });
+        return () => controller.abort();
       } else {
         // Fallback: Ambil daftar masjid dari dataset jika startPoint tidak ada
         fetchMosques(activeDatasetId, limit)
@@ -214,33 +230,34 @@ export default function SafarDashboard() {
   }, [activeDatasetId, startPoint, isGpsChecking, searchSettings.bufferKm, searchSettings.maxCandidates, setMosques]);
 
   // Fetch Prayer Times based on location
-  const activeSchedule = prayerSchedule || [
+  const activeSchedule = useMemo(() => prayerSchedule || [
     { name: "Subuh", time: "04:45", isAlarmActive: true },
     { name: "Dzuhur", time: "12:02", isAlarmActive: false },
     { name: "Ashar", time: "15:24", isAlarmActive: false },
     { name: "Maghrib", time: "17:58", isAlarmActive: true },
     { name: "Isya", time: "19:12", isAlarmActive: false },
-  ];
+  ], [prayerSchedule]);
 
   // Fetch Prayer Times based on location
   useEffect(() => {
-    const fetchPrayerTimes = async () => {
+    const controller = new AbortController();
+    const loadPrayerTimes = async () => {
       const lat = startPoint?.lat ?? -6.2088;
       const lng = startPoint?.lng ?? 106.8456;
       const date = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD
+      const cacheKey = `${date}_${lat.toFixed(2)}_${lng.toFixed(2)}`;
+      if (prayerCacheKey === cacheKey && prayerSchedule?.length) return;
 
       try {
-        const res = await fetch(
-          `https://api.aladhan.com/v1/timings/${date}?latitude=${lat}&longitude=${lng}&method=20` // Method 20 = Kemenag RI
-        );
-        if (!res.ok) throw new Error("Gagal mengambil jadwal");
-        const data = await res.json();
-        const timings = data.data.timings;
-        const hijri = data.data.date.hijri;
-        const gregorian = data.data.date.gregorian;
-
-        setHijriDate(`${hijri.day} ${hijri.month.en} ${hijri.year} H`);
-        setMasehiDate(`${gregorian.day} ${gregorian.month.en} ${gregorian.year}`);
+        const data = await fetchPrayerTimes(lat, lng, date, controller.signal);
+        const timings = data.timings;
+        const dateObject = new Date(`${date}T12:00:00`);
+        setHijriDate(`${new Intl.DateTimeFormat("id-ID-u-ca-islamic", {
+          day: "numeric", month: "long", year: "numeric",
+        }).format(dateObject)} H`);
+        setMasehiDate(new Intl.DateTimeFormat("id-ID", {
+          day: "numeric", month: "long", year: "numeric",
+        }).format(dateObject));
 
         setPrayerSchedule([
           { name: "Subuh", time: timings.Fajr, isAlarmActive: activeSchedule[0]?.isAlarmActive ?? true },
@@ -249,13 +266,17 @@ export default function SafarDashboard() {
           { name: "Maghrib", time: timings.Maghrib, isAlarmActive: activeSchedule[3]?.isAlarmActive ?? true },
           { name: "Isya", time: timings.Isha, isAlarmActive: activeSchedule[4]?.isAlarmActive ?? false },
         ]);
+        setPrayerCacheKey(cacheKey);
       } catch (err) {
-        console.warn("Menggunakan jadwal sholat fallback:", err);
+        if (!controller.signal.aborted) {
+          console.warn("Menggunakan jadwal sholat fallback:", err);
+        }
       }
     };
 
-    fetchPrayerTimes();
-  }, [startPoint, setPrayerSchedule, setHijriDate, setMasehiDate]);
+    loadPrayerTimes();
+    return () => controller.abort();
+  }, [startPoint, prayerCacheKey, prayerSchedule, activeSchedule, setPrayerSchedule, setPrayerCacheKey, setHijriDate, setMasehiDate]);
 
   // Countdown clock to next prayer
   useEffect(() => {
@@ -339,7 +360,7 @@ export default function SafarDashboard() {
           toast.error("Terjadi kesalahan saat mengambil lokasi.");
         }
       },
-      { enableHighAccuracy: true }
+      { enableHighAccuracy: false, maximumAge: 300000, timeout: 4000 }
     );
   }, [setStartPoint]);
 
@@ -358,12 +379,15 @@ export default function SafarDashboard() {
 
 
   const handleRouteToMosque = async (m: any) => {
+    const requestedMosqueId = String(m.id || m.mosque_id || m.name);
+    if (routingMosqueId) return;
     if (!startPoint) {
       toast.error("Lokasi awal tidak ditemukan. Silakan izinkan akses lokasi (GPS) terlebih dahulu.");
       return;
     }
     const algoLabel = searchSettings.algorithm === "astar" ? "A*" : "Dijkstra";
     const toastId = toast.loading(`Mencari rute ${algoLabel} ke ${m.name}...`);
+    setRoutingMosqueId(requestedMosqueId);
     try {
       // Gunakan dataset_id masjid itu sendiri jika activeDatasetId adalah "all"
       // karena graph OSM dibangun per-dataset, bukan lintas dataset
@@ -372,20 +396,29 @@ export default function SafarDashboard() {
         : activeDatasetId!;
       // Batasi bufferKm untuk routing (maks 50km agar tidak overload OSM graph)
       const routeBuffer = Math.min(parseFloat(searchSettings.bufferKm) || 10, 50);
+      const routeKey = buildSelectedRouteCacheKey(datasetForRoute, startPoint.lat, startPoint.lng, requestedMosqueId, searchSettings.algorithm);
+      const cached = routeCache?.[routeKey];
+      if (cached && Date.now() - Number(cached._cached_at || 0) < 5 * 60 * 1000) {
+        setRouteData(cached);
+        toast.success(`Rute (${algoLabel}) dimuat dari cache.`);
+        return;
+      }
       const data = await routeToMosque(
         datasetForRoute,
         startPoint.lat,
         startPoint.lng,
-        m.id,
+        requestedMosqueId,
         searchSettings.algorithm,
         routeBuffer,
-        searchSettings.autoBuild
+        false
       );
       setRouteData(data);
+      setRouteCache(routeKey, data);
       toast.success(`Rute (${algoLabel}) ke ${m.name} berhasil ditemukan.`);
     } catch (err: any) {
       toast.error(err.message || "Gagal menghitung rute navigasi.");
     } finally {
+      setRoutingMosqueId(null);
       toast.dismiss(toastId);
     }
   };
@@ -435,19 +468,23 @@ export default function SafarDashboard() {
           longitude: startPoint.lng
         },
         algorithm: localSettings.algorithm,
-        departure_time: `2026-07-11T${localSettings.currentTime || '17:00'}:00+07:00`,
+        departure_time: `${new Date().toLocaleDateString("en-CA")}T${localSettings.currentTime || '17:00'}:00+07:00`,
         prayer: localSettings.prayer,
         profile: localSettings.profile,
         maximum_results: parseInt(localSettings.maxCandidates),
         search_radius_km: parseFloat(localSettings.bufferKm),
         auto_build_osm: localSettings.autoBuild,
+        compact_response: true,
       };
 
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 12000);
       const res = await fetch(`${API_BASE}/api/v1/routes/recommend`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      }).finally(() => window.clearTimeout(timeoutId));
 
       if (!res.ok) {
         const err = await res.json();
@@ -482,23 +519,47 @@ export default function SafarDashboard() {
     }
   };
 
-  const handleSaveSettings = () => {
+  const handleSaveSettings = async () => {
+    const bufferKm = Number(localSettings.bufferKm);
+    const maxCandidates = Number(localSettings.maxCandidates);
+    if (!Number.isFinite(bufferKm) || bufferKm < 2 || bufferKm > 200) {
+      toast.error("Radius buffer harus antara 2 dan 200 km.");
+      return;
+    }
+    if (!Number.isInteger(maxCandidates) || maxCandidates < 1 || maxCandidates > 10) {
+      toast.error("Jumlah rekomendasi harus antara 1 dan 10.");
+      return;
+    }
+    setSavingSettings(true);
     setSearchSettings(localSettings);
-    toast.success("Pengaturan pencarian berhasil disimpan.");
+    const saved = await saveSettingsToDatabase({
+      searchSettings: localSettings,
+      prayerSettings: { schedule: activeSchedule, hijriDate, masehiDate },
+    });
+    setSavingSettings(false);
+    if (saved) {
+      toast.success("Pengaturan pencarian tersimpan di database.");
+    } else {
+      toast.error("Setelan tersimpan lokal, tetapi gagal disimpan ke database.");
+    }
   };
 
-  const toggleAlarm = (index: number) => {
+  const toggleAlarm = async (index: number) => {
     const updated = activeSchedule.map((p, idx) => 
       idx === index ? { ...p, isAlarmActive: !p.isAlarmActive } : p
     );
+    setSavingAlarmIndex(index);
     setPrayerSchedule(updated);
-
-    if (typeof window !== "undefined") {
-      localStorage.setItem("prayerAlarms", JSON.stringify(updated.map(p => p.isAlarmActive)));
-    }
+    const saved = await saveSettingsToDatabase({
+      searchSettings,
+      prayerSettings: { schedule: updated, hijriDate, masehiDate },
+    });
+    setSavingAlarmIndex(null);
 
     const p = updated[index];
-    if (p.isAlarmActive) {
+    if (!saved) {
+      toast.error("Alarm " + p.name + " berubah lokal, tetapi gagal disimpan ke database.");
+    } else if (p.isAlarmActive) {
       toast.success(`Alarm sholat ${p.name} diaktifkan pada pukul ${p.time}`);
     } else {
       toast.info(`Alarm sholat ${p.name} dinonaktifkan`);
@@ -606,14 +667,17 @@ export default function SafarDashboard() {
   // Route Polyline
   const routePoints = useMemo(() => {
     const geoJson = routeData?.route_geojson || null;
-    return geoJson?.geometry?.coordinates?.map((c: any) => [c[1], c[0]]) as [number, number][] | null;
+    if (geoJson?.geometry?.coordinates) {
+      return geoJson.geometry.coordinates.map((c: [number, number]) => [c[1], c[0]]) as [number, number][];
+    }
+    return routeData?.encoded_polyline ? decodePolyline(routeData.encoded_polyline) : null;
   }, [routeData]);
 
   // Memoize map center to prevent MapViewer re-rendering on every Dashboard re-render (like clock tick)
   const mapCenter = useMemo(() => startPoint ? [startPoint.lat, startPoint.lng] as [number, number] : undefined, [startPoint?.lat, startPoint?.lng]);
 
   return (
-    <main suppressHydrationWarning className="relative h-screen w-screen overflow-hidden bg-slate-50 dark:bg-slate-950">
+    <main suppressHydrationWarning className="relative h-screen w-screen overflow-hidden bg-slate-50">
       {/* Map (Background) */}
       <div suppressHydrationWarning className="absolute inset-0 z-0">
         <MapViewer 
@@ -630,8 +694,8 @@ export default function SafarDashboard() {
         
         {/* Floating Search Bar Card Container */}
         <div className="relative pointer-events-auto w-full">
-          <div className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl border border-slate-200/50 dark:border-slate-800/60 shadow-2xl p-2 rounded-2xl flex items-center gap-2 transition-all duration-300">
-            <div className="p-2 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400">
+          <div className="bg-white/95 backdrop-blur-xl border border-slate-200/50 shadow-2xl p-2 rounded-2xl flex items-center gap-2 transition-all duration-300">
+            <div className="p-2 rounded-xl bg-emerald-50 text-emerald-600">
               <Compass className="w-5 h-5 animate-pulse" />
             </div>
             
@@ -643,7 +707,7 @@ export default function SafarDashboard() {
                 onFocus={() => setIsFocused(true)}
                 onBlur={() => setTimeout(() => setIsFocused(false), 250)}
                 onChange={e => setSearchQuery(e.target.value)}
-                className="w-full bg-transparent border-none outline-none text-xs font-bold text-slate-800 dark:text-slate-100 placeholder-slate-400 h-9"
+                className="w-full bg-transparent border-none outline-none text-xs font-bold text-slate-800 placeholder-slate-400 h-9"
               />
             </div>
 
@@ -656,7 +720,7 @@ export default function SafarDashboard() {
               </button>
             )}
 
-            <div className="h-6 w-[1px] bg-slate-200 dark:bg-slate-800"></div>
+            <div className="h-6 w-[1px] bg-slate-200"></div>
 
             {/* Action buttons (Prayer & Settings) */}
             <div className="flex gap-0.5">
@@ -665,7 +729,7 @@ export default function SafarDashboard() {
                 className={`p-2 rounded-xl transition-all cursor-pointer ${
                   showPrayer 
                     ? "bg-emerald-500 text-white shadow-md shadow-emerald-500/20" 
-                    : "text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                    : "text-slate-400 hover:text-slate-600"
                 }`}
                 title="Jadwal Sholat"
               >
@@ -676,7 +740,7 @@ export default function SafarDashboard() {
                 className={`p-2 rounded-xl transition-all cursor-pointer ${
                   showSettings 
                     ? "bg-emerald-500 text-white shadow-md shadow-emerald-500/20" 
-                    : "text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                    : "text-slate-400 hover:text-slate-600"
                 }`}
                 title="Pengaturan Pencarian"
               >
@@ -684,7 +748,7 @@ export default function SafarDashboard() {
               </button>
               <button
                 onClick={() => router.push('/admin')}
-                className="p-2 rounded-xl transition-all cursor-pointer text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400"
+                className="p-2 rounded-xl transition-all cursor-pointer text-slate-400 hover:text-indigo-500"
                 title="Halaman Admin"
               >
                 <Shield className="w-4.5 h-4.5" />
@@ -694,13 +758,13 @@ export default function SafarDashboard() {
 
           {/* Autocomplete Dropdown - aligned to the whole card! */}
           {isFocused && filteredMosques.length > 0 && (
-            <div className="absolute left-0 right-0 top-full mt-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl overflow-hidden divide-y divide-slate-50 dark:divide-slate-850 z-50 animate-in fade-in slide-in-from-top-2 duration-200">
+            <div className="absolute left-0 right-0 top-full mt-2 bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden divide-y divide-slate-50 z-50 animate-in fade-in slide-in-from-top-2 duration-200">
               {filteredMosques.map((m, idx) => {
                 const rating = m.rating ? parseFloat(String(m.rating).replace(",", ".")) : 0;
                 return (
                   <div 
                     key={`${m.id || 'mosque'}-${idx}`}
-                    className="px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/80 cursor-pointer text-xs transition-all flex items-center justify-between gap-3"
+                    className="px-4 py-3 hover:bg-slate-50 cursor-pointer text-xs transition-all flex items-center justify-between gap-3"
                     onMouseDown={() => {
                       setEndPoint({ lat: m.latitude, lng: m.longitude });
                       setSearchQuery(m.name);
@@ -708,25 +772,25 @@ export default function SafarDashboard() {
                     }}
                   >
                     <div className="flex items-start gap-2.5 min-w-0">
-                      <MapPin className="w-4.5 h-4.5 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+                      <MapPin className="w-4.5 h-4.5 text-emerald-600 shrink-0 mt-0.5" />
                       <div className="flex flex-col min-w-0 gap-0.5">
-                        <span className="font-extrabold text-slate-800 dark:text-slate-100 truncate">{m.name}</span>
-                        <span className="text-[10px] text-slate-400 dark:text-slate-500 font-semibold truncate">
+                        <span className="font-extrabold text-slate-800 truncate">{m.name}</span>
+                        <span className="text-[10px] text-slate-400 font-semibold truncate">
                           {m.kecamatan || "-"}, {m.kabko?.replace("KOTA ADMINISTRASI ", "") || "-"}
                         </span>
                       </div>
                     </div>
                     
                     <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-800/60 px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                        <span className="text-[10px] font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded flex items-center gap-0.5">
                           <MapPin className="w-2.5 h-2.5" /> {formatDistance(m.distance_km)}
                         </span>
                       {rating > 0 ? (
-                        <span className="text-[10px] font-black text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                        <span className="text-[10px] font-black text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded flex items-center gap-0.5">
                           <Star className="w-2.5 h-2.5 fill-amber-500" /> {rating.toFixed(1)}
                         </span>
                       ) : (
-                        <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-800/60 px-1.5 py-0.5 rounded">
+                        <span className="text-[10px] font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded">
                           T{m.tier || "D"}
                         </span>
                       )}
@@ -754,7 +818,7 @@ export default function SafarDashboard() {
               className={`px-3 py-1.5 rounded-xl border text-[10px] font-extrabold whitespace-nowrap cursor-pointer transition-all duration-300 ${
                 chip.state 
                   ? "bg-emerald-600 border-emerald-600 text-white shadow-md shadow-emerald-600/20" 
-                  : "bg-white/90 dark:bg-slate-900/90 text-slate-600 dark:text-slate-300 border-slate-200/50 dark:border-slate-800/40 backdrop-blur-md hover:bg-white"
+                  : "bg-white/90 text-slate-600 border-slate-200/50 backdrop-blur-md hover:bg-white"
               }`}
             >
               {chip.label}
@@ -764,15 +828,17 @@ export default function SafarDashboard() {
 
         {/* Floating Search Settings Popover Card */}
         {showSettings && (
-          <Card className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl border border-slate-200/50 dark:border-slate-800/60 shadow-2xl rounded-2xl pointer-events-auto overflow-hidden animate-in slide-in-from-top duration-300">
+          <Card className="bg-white/95 backdrop-blur-xl border border-slate-200/50 shadow-2xl rounded-2xl pointer-events-auto overflow-hidden animate-in slide-in-from-top duration-300">
             <CardHeader className="p-4 pb-2 flex flex-row items-center justify-between">
               <div>
                 <CardTitle className="text-xs font-black uppercase tracking-wider text-slate-400">Pengaturan Pencarian</CardTitle>
-                <CardDescription className="text-[10px] mt-0.5">Konfigurasi algoritma & rute perjalanan.</CardDescription>
+                <CardDescription className="text-[10px] mt-0.5">
+                  Konfigurasi algoritma & rute · {settingsSyncStatus === "loaded" ? "database tersinkron" : settingsSyncStatus === "loading" ? "memuat database" : "mode lokal"}
+                </CardDescription>
               </div>
               <button 
                 onClick={() => setShowSettings(false)}
-                className="p-1 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                className="p-1 rounded-lg text-slate-400 hover:text-slate-600"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -785,7 +851,7 @@ export default function SafarDashboard() {
                     value={localSettings.algorithm} 
                     onValueChange={(val) => setLocalSettings(prev => ({ ...prev, algorithm: val as string }))}
                   >
-                    <SelectTrigger className="h-8.5 bg-slate-50 dark:bg-slate-950/60 text-xs">
+                    <SelectTrigger className="h-8.5 bg-slate-50 text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -800,7 +866,7 @@ export default function SafarDashboard() {
                     value={localSettings.profile} 
                     onValueChange={(val) => setLocalSettings(prev => ({ ...prev, profile: val as string }))}
                   >
-                    <SelectTrigger className="h-8.5 bg-slate-50 dark:bg-slate-950/60 text-xs">
+                    <SelectTrigger className="h-8.5 bg-slate-50 text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -820,7 +886,7 @@ export default function SafarDashboard() {
                     type="time" 
                     value={localSettings.currentTime} 
                     onChange={e => setLocalSettings(prev => ({ ...prev, currentTime: e.target.value }))}
-                    className="h-8.5 bg-slate-50 dark:bg-slate-950/60 text-xs px-2" 
+                    className="h-8.5 bg-slate-50 text-xs px-2" 
                   />
                 </div>
                 <div className="space-y-1">
@@ -829,7 +895,7 @@ export default function SafarDashboard() {
                     value={localSettings.prayer} 
                     onValueChange={(val) => setLocalSettings(prev => ({ ...prev, prayer: val as string }))}
                   >
-                    <SelectTrigger className="h-8.5 bg-slate-50 dark:bg-slate-950/60 text-xs">
+                    <SelectTrigger className="h-8.5 bg-slate-50 text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -852,7 +918,7 @@ export default function SafarDashboard() {
                     max="200" 
                     value={localSettings.bufferKm} 
                     onChange={e => setLocalSettings(prev => ({ ...prev, bufferKm: e.target.value }))}
-                    className="h-8.5 bg-slate-50 dark:bg-slate-950/60 text-xs px-2" 
+                    className="h-8.5 bg-slate-50 text-xs px-2" 
                   />
                 </div>
                 <div className="space-y-1">
@@ -863,7 +929,7 @@ export default function SafarDashboard() {
                     max="10" 
                     value={localSettings.maxCandidates} 
                     onChange={e => setLocalSettings(prev => ({ ...prev, maxCandidates: e.target.value }))}
-                    className="h-8.5 bg-slate-50 dark:bg-slate-950/60 text-xs px-2" 
+                    className="h-8.5 bg-slate-50 text-xs px-2" 
                   />
                 </div>
               </div>
@@ -875,17 +941,18 @@ export default function SafarDashboard() {
                   onCheckedChange={(c) => setLocalSettings(prev => ({ ...prev, autoBuild: !!c }))}
                   className="rounded"
                 />
-                <label htmlFor="autoBuild" className="text-[10px] font-bold text-slate-600 dark:text-slate-400 leading-none">
+                <label htmlFor="autoBuild" className="text-[10px] font-bold text-slate-600 leading-none">
                   Otomatis build peta jika tidak tersedia
                 </label>
               </div>
 
-              <div className="flex gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <div className="flex gap-2 pt-2 border-t border-slate-100">
                 <Button 
                   onClick={handleSaveSettings}
-                  className="flex-1 h-9 bg-slate-900 hover:bg-slate-800 text-white dark:bg-slate-800 dark:hover:bg-slate-700 font-bold text-xs rounded-xl"
+                  disabled={savingSettings || settingsSyncStatus === "loading"}
+                  className="flex-1 h-9 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl"
                 >
-                  Simpan Setelan
+                  {savingSettings ? "Menyimpan..." : "Simpan Setelan"}
                 </Button>
                 <Button 
                   onClick={handleRouteSearch}
@@ -902,7 +969,7 @@ export default function SafarDashboard() {
 
         {/* Floating Prayer Times Popover Card */}
         {showPrayer && (
-          <Card className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl border border-slate-200/50 dark:border-slate-800/60 shadow-2xl rounded-2xl pointer-events-auto overflow-hidden animate-in slide-in-from-top duration-300">
+          <Card className="bg-white/95 backdrop-blur-xl border border-slate-200/50 shadow-2xl rounded-2xl pointer-events-auto overflow-hidden animate-in slide-in-from-top duration-300">
             <CardHeader className="p-4 pb-2 bg-gradient-to-r from-emerald-800 via-emerald-950 to-teal-900 text-white flex flex-row items-start justify-between">
               <div>
                 <span className="text-[9px] uppercase font-black text-emerald-300 tracking-wider block">Jadwal Adzan & Alarm</span>
@@ -918,27 +985,29 @@ export default function SafarDashboard() {
             </CardHeader>
             <CardContent className="p-0">
               {/* Countdown */}
-              <div className="bg-emerald-500/10 dark:bg-emerald-950/20 px-4 py-3 flex items-center justify-between border-b border-slate-100 dark:border-slate-800/80">
-                <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400">Salat Berikutnya: <strong className="text-slate-800 dark:text-slate-200 font-extrabold">{nextPrayer.name}</strong></span>
-                <span className="text-sm font-mono font-black text-emerald-600 dark:text-emerald-400 tracking-wider animate-pulse">{nextPrayer.countdown}</span>
+              <div className="bg-emerald-500/10 px-4 py-3 flex items-center justify-between border-b border-slate-100">
+                <span className="text-[10px] font-bold text-slate-500">Salat Berikutnya: <strong className="text-slate-800 font-extrabold">{nextPrayer.name}</strong></span>
+                <span className="text-sm font-mono font-black text-emerald-600 tracking-wider animate-pulse">{nextPrayer.countdown}</span>
               </div>
               
               {/* Timings list */}
-              <div className="divide-y divide-slate-100 dark:divide-slate-800/80">
+              <div className="divide-y divide-slate-100">
                 {activeSchedule.map((p, idx) => (
-                  <div key={p.name} className="flex items-center justify-between px-4 py-3 hover:bg-slate-50/50 dark:hover:bg-slate-800/30 transition-colors">
+                  <div key={p.name} className="flex items-center justify-between px-4 py-3 hover:bg-slate-50/50 transition-colors">
                     <div className="flex items-center gap-2">
-                      <div className={`w-2 h-2 rounded-full ${p.name === nextPrayer.name ? "bg-emerald-500 animate-ping" : "bg-slate-200 dark:bg-slate-700"}`}></div>
-                      <span className="text-xs font-bold text-slate-700 dark:text-slate-300">{p.name}</span>
+                      <div className={`w-2 h-2 rounded-full ${p.name === nextPrayer.name ? "bg-emerald-500 animate-ping" : "bg-slate-200"}`}></div>
+                      <span className="text-xs font-bold text-slate-700">{p.name}</span>
                     </div>
                     <div className="flex items-center gap-4">
-                      <span className="font-mono text-xs font-black text-slate-800 dark:text-slate-200">{p.time}</span>
+                      <span className="font-mono text-xs font-black text-slate-800">{p.time}</span>
                       <button
                         onClick={() => toggleAlarm(idx)}
+                        disabled={savingAlarmIndex !== null || settingsSyncStatus === "loading"}
+                        aria-label={(p.isAlarmActive ? "Nonaktifkan" : "Aktifkan") + " alarm " + p.name}
                         className={`p-1.5 rounded-lg border transition-all ${
                           p.isAlarmActive
-                            ? "bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/40"
-                            : "bg-white dark:bg-slate-900 text-slate-400 border-slate-200 dark:border-slate-850"
+                            ? "bg-emerald-50 text-emerald-600 border-emerald-200"
+                            : "bg-white text-slate-400 border-slate-200"
                         }`}
                       >
                         {p.isAlarmActive ? <Bell className="w-3.5 h-3.5 fill-emerald-600/10" /> : <BellOff className="w-3.5 h-3.5" />}
@@ -964,7 +1033,7 @@ export default function SafarDashboard() {
         <button
           onClick={handleLocateMe}
           disabled={loading}
-          className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md text-slate-700 dark:text-slate-200 hover:bg-emerald-50 dark:hover:bg-emerald-900/40 hover:text-emerald-600 border border-slate-200/50 dark:border-slate-800/50 w-[42px] h-[42px] rounded-2xl shadow-xl flex items-center justify-center transition-all disabled:opacity-50"
+          className="bg-white/95 backdrop-blur-md text-slate-700 hover:bg-emerald-50 hover:text-emerald-600 border border-slate-200/50 w-[42px] h-[42px] rounded-2xl shadow-xl flex items-center justify-center transition-all disabled:opacity-50"
           title="Lokasi Saya"
         >
           {loading ? <div className="w-5 h-5 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin"></div> : <Locate className="w-[22px] h-[22px]" />}
@@ -972,35 +1041,35 @@ export default function SafarDashboard() {
       </div>
 
       <Dialog open={showLocationPopup} onOpenChange={setShowLocationPopup}>
-        <DialogContent className="sm:max-w-[425px] border-none shadow-2xl bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl z-[10000]">
+        <DialogContent className="sm:max-w-[425px] border-none shadow-2xl bg-white/95 backdrop-blur-xl z-[10000]">
           <DialogHeader>
-            <div className="mx-auto w-16 h-16 bg-rose-100 dark:bg-rose-950/50 text-rose-600 dark:text-rose-400 rounded-full flex items-center justify-center mb-4 ring-8 ring-rose-50 dark:ring-rose-950/20">
+            <div className="mx-auto w-16 h-16 bg-rose-100 text-rose-600 rounded-full flex items-center justify-center mb-4 ring-8 ring-rose-50">
               <MapPin className="w-8 h-8 animate-bounce" />
             </div>
-            <DialogTitle className="text-center text-2xl font-extrabold text-slate-800 dark:text-white">
+            <DialogTitle className="text-center text-2xl font-extrabold text-slate-800">
               Yah, Akses Lokasi Mati 😔
             </DialogTitle>
-            <DialogDescription className="text-center pt-2 text-slate-600 dark:text-slate-400 font-medium">
+            <DialogDescription className="text-center pt-2 text-slate-600 font-medium">
               Aplikasi butuh lokasi Anda untuk mencari masjid terdekat. Ikuti 3 langkah mudah ini untuk menyalakannya:
             </DialogDescription>
           </DialogHeader>
 
-          <div className="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-4 mt-2 space-y-4 border border-slate-100 dark:border-slate-800">
+          <div className="bg-slate-50 rounded-xl p-4 mt-2 space-y-4 border border-slate-100">
             <div className="flex gap-3 items-start">
-              <div className="w-7 h-7 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 flex items-center justify-center flex-shrink-0 font-bold text-sm">1</div>
-              <p className="text-sm text-slate-700 dark:text-slate-300 leading-snug">
+              <div className="w-7 h-7 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center flex-shrink-0 font-bold text-sm">1</div>
+              <p className="text-sm text-slate-700 leading-snug">
                 Klik ikon <strong>gembok 🔒</strong> atau <strong>info ⓘ</strong> di pojok kiri atas (sebelah alamat web iMosque).
               </p>
             </div>
             <div className="flex gap-3 items-start">
-              <div className="w-7 h-7 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 flex items-center justify-center flex-shrink-0 font-bold text-sm">2</div>
-              <p className="text-sm text-slate-700 dark:text-slate-300 leading-snug">
+              <div className="w-7 h-7 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center flex-shrink-0 font-bold text-sm">2</div>
+              <p className="text-sm text-slate-700 leading-snug">
                 Pilih menu <strong>Izin (Permissions)</strong> atau langsung cari <strong>Lokasi (Location)</strong>.
               </p>
             </div>
             <div className="flex gap-3 items-start">
-              <div className="w-7 h-7 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 flex items-center justify-center flex-shrink-0 font-bold text-sm">3</div>
-              <p className="text-sm text-slate-700 dark:text-slate-300 leading-snug">
+              <div className="w-7 h-7 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center flex-shrink-0 font-bold text-sm">3</div>
+              <p className="text-sm text-slate-700 leading-snug">
                 Ubah menjadi <strong>Izinkan (Allow)</strong>, lalu klik tombol Refresh di bawah ini.
               </p>
             </div>
@@ -1018,7 +1087,7 @@ export default function SafarDashboard() {
             <Button 
               onClick={() => setShowLocationPopup(false)} 
               variant="outline"
-              className="w-full sm:flex-1 rounded-xl font-bold h-11 sm:h-12 text-sm border-slate-200 dark:border-slate-700 dark:hover:bg-slate-800 flex items-center justify-center gap-2"
+              className="w-full sm:flex-1 rounded-xl font-bold h-11 sm:h-12 text-sm border-slate-200 flex items-center justify-center gap-2"
             >
               <X className="w-4 h-4 sm:w-5 sm:h-5 text-slate-500" />
               Nanti Saja
@@ -1028,7 +1097,7 @@ export default function SafarDashboard() {
       </Dialog>
 
       {/* Mosque Detail Drawer (Slides from bottom/left) */}
-      <MosqueDetailDrawer />
+      {selectedMosque && <MosqueDetailDrawer />}
     </main>
   );
 }

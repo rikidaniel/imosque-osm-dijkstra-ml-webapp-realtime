@@ -1,102 +1,108 @@
 # iMosque OSM Dijkstra ML Web App
 
-Project ini adalah prototype **Safar Mode iMosque** dengan alur:
+Project ini adalah prototype Safar Mode iMosque untuk mencari masjid terdekat dan menghitung rute perjalanan secara cepat di web.
+
+Alur sistemnya:
 
 ```text
 CSV dataset masjid per wilayah
-→ upload / pilih dataset dari frontend
-→ ML enrichment realtime
-→ enriched JSON
-→ marker masjid di peta Leaflet
-→ OpenStreetMap road graph via OSMnx
-→ Dijkstra/A* routing
-→ GeoJSON route ke frontend
+-> upload / pilih dataset dari frontend
+-> ML enrichment realtime
+-> data masjid tersimpan di ArangoDB
+-> marker masjid tampil di Leaflet
+-> OpenStreetMap road graph dibaca dari cache GraphML
+-> nearest-node index dipakai untuk snap titik
+-> Dijkstra / A* multi-destination
+-> encoded polyline / GeoJSON ke frontend
 ```
 
-Versi ini sudah mendukung **ganti-ganti dataset lewat frontend**. Misalnya kamu punya CSV/tab untuk:
-
-- Banten
-- DKI Jakarta
-- Jawa Barat
-- Jawa Tengah
-- Jawa Timur
-- DI Yogyakarta
-
-Kamu bisa upload CSV-nya satu per satu dari website, lalu pilih dataset aktif tanpa restart backend.
+Versi ini mendukung ganti dataset lewat frontend tanpa restart backend. Jadi anggota kelompok bisa upload CSV masing-masing, lalu memilih dataset aktif langsung dari UI.
 
 ## Fitur Utama
 
-1. **Dataset switcher realtime**
+1. Dataset switcher realtime
    - Upload CSV baru dari frontend.
    - Dataset langsung diproses ML enrichment.
    - Dataset tersimpan di `data/raw/datasets/`.
-   - Hasil JSON tersimpan per dataset di `data/processed/<dataset_id>/enriched_mosques.json`.
+   - Hasil enrichment tersimpan per dataset di `data/processed/<dataset_id>/enriched_mosques.json`.
    - Marker peta otomatis berubah sesuai dataset aktif.
 
-2. **AI/ML enrichment**
+2. AI/ML enrichment
    - Cleaning latitude-longitude.
-   - Filter koordinat umum Indonesia + filter bounds provinsi untuk Banten, DKI Jakarta, Jawa Barat, Jawa Tengah, Jawa Timur, dan DI Yogyakarta.
+   - Filter koordinat umum Indonesia dan bounds provinsi.
    - Prediksi `rating` kosong memakai Random Forest Regressor.
-   - Prediksi `facilities` kosong memakai TF-IDF + One-vs-Rest Logistic Regression.
+   - Prediksi `facilities` kosong memakai TF-IDF dan One-vs-Rest Logistic Regression.
    - Membuat `capacity_proxy`, `priority_score`, dan `tier`.
 
-3. **Routing OpenStreetMap**
-   - Road network diambil dari **OpenStreetMap** via OSMnx.
-   - Start, destination, dan masjid kandidat di-*snap* ke node jalan terdekat.
-   - Dijkstra/A* dijalankan pada graph jalan OSM.
-   - Rute dikirim ke frontend sebagai GeoJSON.
+3. Routing OpenStreetMap
+   - Road network diambil dari OpenStreetMap via OSMnx.
+   - Graph disimpan sebagai GraphML per dataset.
+   - Titik awal, tujuan, dan masjid kandidat di-snap ke node jalan terdekat.
+   - Dijkstra/A* multi-destination dijalankan hanya untuk kandidat yang dibutuhkan.
+   - Rute dikirim sebagai polyline ter-encode atau GeoJSON ringkas.
 
-4. **Multi-objective scoring**
+4. Multi-objective scoring
    - Waktu tempuh.
    - Jarak tempuh.
-   - Kesesuaian waktu shalat/adzan.
+   - Kesesuaian waktu salat/adzan.
    - Kapasitas proxy.
    - Priority score hasil enrichment.
 
+5. Optimasi performa
+   - Cache GraphML in-memory.
+   - Spatial index nearest-node dibangun sekali lalu dipakai ulang.
+   - Singleflight untuk mencegah request rute ganda saat tombol ditekan berulang.
+   - Cache hasil route sementara.
+   - GZip response untuk payload API.
+   - Compact response dengan encoded polyline agar hemat bandwidth.
+   - Service worker frontend membantu cache tile peta dan aset statis.
+
+## Teknologi yang Dipakai
+
+- Frontend: Next.js, React, Leaflet
+- Backend: FastAPI, Uvicorn
+- Database: ArangoDB
+- Graph routing: OSMnx, NetworkX, SciPy, scikit-learn
+- Enrichment: pandas, numpy, joblib, TF-IDF, Random Forest, Logistic Regression
+- Peta: OpenStreetMap tiles
+
 ## Catatan Jujur Akademik
 
-Atribut hasil ML seperti `facilities`, `capacity_proxy`, `priority_score`, dan `tier` adalah **estimasi/proxy**, bukan data lapangan terverifikasi. Road network berasal dari OpenStreetMap, bukan Google Maps.
+Atribut hasil ML seperti `facilities`, `capacity_proxy`, `priority_score`, dan `tier` adalah estimasi/proxy, bukan data lapangan terverifikasi. Road network berasal dari OpenStreetMap, bukan Google Maps.
 
 Kalimat aman untuk laporan:
 
-> Sistem menggunakan AI/ML enrichment untuk melengkapi atribut pendukung routing, kemudian melakukan pencarian rute menggunakan algoritma Dijkstra pada graph jalan OpenStreetMap. Atribut hasil enrichment diperlakukan sebagai proxy estimation, bukan fakta lapangan aktual.
+> Sistem menggunakan AI/ML enrichment untuk melengkapi atribut pendukung routing, lalu melakukan pencarian rute menggunakan algoritma Dijkstra atau A* pada graph jalan OpenStreetMap. Atribut hasil enrichment diperlakukan sebagai proxy estimation, bukan fakta lapangan aktual.
 
 ## Struktur Project
 
 ```text
 imosque-osm-dijkstra-ml-webapp/
-├── backend/
-│   ├── requirements.txt
-│   └── app/
-│       ├── main.py
-│       ├── ml_enrichment.py
-│       ├── osm_graph.py
-│       ├── routing_osm.py
-│       └── schemas.py
-├── frontend/
-│   ├── index.html
-│   ├── app.js
-│   └── style.css
-├── scripts/
-│   ├── run_ml_pipeline.py
-│   ├── build_osm_graph.py
-│   └── test_route_request.py
-├── data/
-│   ├── raw/
-│   │   ├── dataset_masjid_banten.csv
-│   │   └── datasets/
-│   │       └── banten.csv
-│   ├── processed/
-│   │   ├── active_dataset.json
-│   │   └── banten/
-│   │       ├── enriched_mosques.json
-│   │       └── data_profile_summary.json
-│   └── osm_cache/
-├── docs/
-├── outputs/
-├── start_backend.bat
-├── start_frontend.bat
-└── run_ml_pipeline.bat
+|-- backend/
+|   |-- requirements.txt
+|   `-- app/
+|       |-- main.py
+|       |-- ml_enrichment.py
+|       |-- osm_graph.py
+|       |-- routing_osm.py
+|       `-- schemas.py
+|-- frontend/
+|   |-- index.html
+|   |-- app.js
+|   `-- style.css
+|-- scripts/
+|   |-- run_ml_pipeline.py
+|   |-- build_osm_graph.py
+|   `-- test_route_request.py
+|-- data/
+|   |-- raw/
+|   |-- processed/
+|   `-- osm_cache/
+|-- docs/
+|-- outputs/
+|-- start_backend.bat
+|-- start_frontend.bat
+`-- run_ml_pipeline.bat
 ```
 
 ## Format CSV yang Dibutuhkan
@@ -115,10 +121,10 @@ name, address, postal_code, latitude, longitude,
 rating, review_count, checkin_count, mosque_type, mosque_topology, facilities
 ```
 
-Kalau dataset masih di Google Sheets seperti pada gambar, lakukan:
+Kalau dataset masih di Google Sheets, lakukan:
 
 ```text
-File → Download → Comma Separated Values (.csv)
+File > Download > Comma Separated Values (.csv)
 ```
 
 Lakukan untuk setiap tab, misalnya tab DKI Jakarta, Jawa Barat, Jawa Tengah, dan seterusnya. Setelah itu upload dari frontend.
@@ -176,7 +182,7 @@ http://localhost:3000
 ## Cara Ganti Dataset dari Frontend
 
 1. Buka website frontend.
-2. Pada bagian **Dataset Realtime**, pilih file CSV.
+2. Pada bagian Dataset Realtime, pilih file CSV.
 3. Isi nama dataset, contoh:
 
 ```text
@@ -186,40 +192,56 @@ jawa_tengah
 jawa_timur
 ```
 
-4. Klik **Upload + Proses ML**.
+4. Klik Upload + Proses ML.
 5. Setelah selesai, marker peta akan berpindah ke dataset baru.
-6. Untuk kembali ke dataset lain, pilih dari dropdown **Dataset aktif**, lalu klik **Gunakan Dataset**.
+6. Untuk kembali ke dataset lain, pilih dari dropdown Dataset aktif, lalu klik Gunakan Dataset.
 
 ## Cara Routing
 
 1. Pilih dataset aktif.
-2. Klik **Load Marker Masjid**.
-3. Klik **Set Start**, lalu klik titik awal di peta.
-4. Klik **Set Destination**, lalu klik titik tujuan di peta.
-5. Centang **Auto-build/rebuild OSM graph saat routing** agar backend otomatis mengambil road network OSM untuk area tersebut.
-6. Klik **Cari Rute Dijkstra**.
+2. Klik Load Marker Masjid.
+3. Klik Set Start, lalu klik titik awal di peta.
+4. Klik Set Destination, lalu klik titik tujuan di peta.
+5. Centang Auto-build/rebuild OSM graph saat routing hanya jika graph untuk area itu belum tersedia.
+6. Klik Cari Rute Dijkstra atau Cari Rute A*.
 
 Catatan: build OSM butuh internet dan bisa memakan waktu tergantung luas buffer area.
 
 ## Endpoint API Penting
 
-```text
-GET  /api/v1/health
-GET  /api/v1/datasets
-POST /api/v1/datasets/upload
-POST /api/v1/datasets/active
-POST /api/v1/pipeline/run?dataset_id=<id>
-GET  /api/v1/profile?dataset_id=<id>
-GET  /api/v1/mosques?dataset_id=<id>&limit=3000
-POST /api/v1/routes/recommend
-POST /api/v1/routes/benchmark
-GET  /api/v1/routing-profiles
-GET  /api/v1/routes/{route_id}
-```
+Semua endpoint tersedia di `docs/api.md`. Yang paling sering dipakai:
 
-Contoh upload dataset dilakukan dari frontend menggunakan `multipart/form-data`.
+- `GET /api/v1/health`
+- `GET /api/v1/datasets`
+- `POST /api/v1/datasets/upload`
+- `POST /api/v1/datasets/active`
+- `POST /api/v1/pipeline/run?dataset_id=<id>`
+- `GET /api/v1/profile?dataset_id=<id>`
+- `GET /api/v1/mosques?dataset_id=<id>&limit=3000`
+- `POST /api/v1/nearest-mosques`
+- `GET /api/v1/prayer-times`
+- `POST /api/v1/routes/recommend`
+- `POST /api/v1/route/to-mosque`
+- `POST /api/v1/routes/benchmark`
+- `GET /api/v1/routing-profiles`
+- `POST /api/v1/osm/build-bbox`
+- `POST /api/v1/osm/build-route`
+- `POST /api/v1/osm/build-all`
+- `GET /api/v1/osm/build-all/status`
+- `POST /api/v1/user-settings`
+- `GET /api/v1/user-settings/{user_id}`
 
-Contoh request routing:
+## Kenapa Aplikasi Ini Lebih Cepat
+
+1. Graph OSM dibangun sekali lalu disimpan sebagai GraphML.
+2. Graph dibaca lewat cache in-memory sehingga parse file besar tidak diulang di setiap request.
+3. Nearest-node index dibangun sekali dan dipakai untuk banyak query.
+4. Routing memakai multi-destination Dijkstra/A* sehingga pencarian berhenti setelah kandidat yang diperlukan ditemukan.
+5. Payload API diperkecil dengan encoded polyline dan compact response.
+6. Frontend menyalakan GZip dan service worker untuk mengurangi beban jaringan.
+7. Waktu salat dihitung lokal, jadi tidak tergantung API eksternal yang lambat.
+
+## Contoh Request Routing
 
 ```json
 {
@@ -228,46 +250,12 @@ Contoh request routing:
   "start_lon": 106.8166,
   "end_lat": -6.2501,
   "end_lon": 106.9002,
-  "algorithm": "dijkstra",
+  "algorithm": "astar",
   "current_time": "17:35",
   "prayer_time": "18:05",
   "max_candidates": 6,
-  "auto_build_osm": true,
+  "auto_build_osm": false,
   "buffer_km": 6
-}
-```
-
-## Output JSON ke Frontend
-
-Backend mengirim:
-
-- `recommended_mosque`
-- `route_summary`
-- `route_geojson`
-- `candidate_mosques`
-- `dataset_id`
-
-Contoh ringkas:
-
-```json
-{
-  "algorithm": "Dijkstra",
-  "dataset_id": "dki_jakarta",
-  "road_network": "OpenStreetMap via OSMnx/NetworkX",
-  "recommended_mosque": {
-    "name": "Masjid Contoh",
-    "latitude": -6.2,
-    "longitude": 106.8,
-    "tier": "B",
-    "capacity_proxy": "medium"
-  },
-  "route_geojson": {
-    "type": "Feature",
-    "geometry": {
-      "type": "LineString",
-      "coordinates": [[106.8, -6.2], [106.81, -6.21]]
-    }
-  }
 }
 ```
 
@@ -275,5 +263,5 @@ Contoh ringkas:
 
 - Kapasitas dan fasilitas adalah estimasi/proxy, bukan hasil survei lapangan.
 - Akurasi rute bergantung pada kualitas data OpenStreetMap.
-- Untuk ganti wilayah, OSM graph perlu dibuat ulang sesuai area start-destination.
-- Project ini prototype UAS, bukan pengganti Google Maps production.
+- Untuk wilayah baru, graph OSM perlu dibangun atau di-refresh sesuai area data.
+- Project ini prototype akademik, bukan pengganti Google Maps production.

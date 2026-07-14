@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useAppStore } from "@/lib/store";
 import { formatDistance } from "@/lib/utils";
 import { 
@@ -9,7 +10,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
-import { routeToMosque } from "@/lib/api";
+import { buildSelectedRouteCacheKey, routeToMosque } from "@/lib/api";
 
 // Helper function to map facilities to icons/labels
 const getFacilityBadge = (fac: string) => {
@@ -29,7 +30,8 @@ const getFacilityBadge = (fac: string) => {
 };
 
 export default function MosqueDetailDrawer() {
-  const { selectedMosque, setSelectedMosque, startPoint, activeDatasetId, setRouteData, searchSettings } = useAppStore();
+  const { selectedMosque, setSelectedMosque, startPoint, activeDatasetId, setRouteData, searchSettings, routeCache, setRouteCache } = useAppStore();
+  const [isRouting, setIsRouting] = useState(false);
 
   if (!selectedMosque) return null;
 
@@ -46,12 +48,14 @@ export default function MosqueDetailDrawer() {
   }
 
   const handleRouteToMosqueAction = async () => {
+    if (isRouting) return;
     if (!startPoint) {
       toast.error("Lokasi awal Anda belum terdeteksi. Izinkan GPS terlebih dahulu.");
       return;
     }
     const algoLabel = searchSettings.algorithm === "astar" ? "A*" : "Dijkstra";
     const toastId = toast.loading(`Menghitung rute optimal (${algoLabel}) ke ${m.name}...`);
+    setIsRouting(true);
     try {
       // Gunakan dataset_id masjid itu sendiri jika activeDatasetId adalah "all"
       const datasetForRoute = (activeDatasetId === "all" || !activeDatasetId)
@@ -59,21 +63,32 @@ export default function MosqueDetailDrawer() {
         : activeDatasetId;
       // Batasi bufferKm untuk routing (maks 50km)
       const routeBuffer = Math.min(parseFloat(searchSettings.bufferKm) || 10, 50);
+      const mosqueId = String(m.id || m.mosque_id || m.name);
+      const routeKey = buildSelectedRouteCacheKey(datasetForRoute, startPoint.lat, startPoint.lng, mosqueId, searchSettings.algorithm);
+      const cached = routeCache?.[routeKey];
+      if (cached && Date.now() - Number(cached._cached_at || 0) < 5 * 60 * 1000) {
+        setRouteData(cached);
+        setSelectedMosque(null);
+        toast.success(`Rute (${algoLabel}) dimuat dari cache.`);
+        return;
+      }
       const data = await routeToMosque(
         datasetForRoute,
         startPoint.lat,
         startPoint.lng,
-        m.id || m.mosque_id || m.name,
+        mosqueId,
         searchSettings.algorithm,
         routeBuffer,
-        searchSettings.autoBuild
+        false
       );
       setRouteData(data);
+      setRouteCache(routeKey, data);
       setSelectedMosque(null); // Close drawer on route search success
       toast.success(`Rute (${algoLabel}) ke ${m.name} berhasil ditemukan.`);
     } catch (err: any) {
       toast.error(err.message || "Gagal menghitung rute navigasi.");
     } finally {
+      setIsRouting(false);
       toast.dismiss(toastId);
     }
   };
@@ -215,9 +230,10 @@ export default function MosqueDetailDrawer() {
           <Button 
             className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold flex items-center justify-center gap-2"
             onClick={handleRouteToMosqueAction}
+            disabled={isRouting}
           >
             <Navigation className="w-4 h-4" />
-            Mulai Rute
+            {isRouting ? "Menghitung..." : "Mulai Rute"}
           </Button>
         </div>
 

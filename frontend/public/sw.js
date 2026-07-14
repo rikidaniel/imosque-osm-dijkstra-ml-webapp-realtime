@@ -1,15 +1,16 @@
 // iMosque Progressive Web App - Service Worker
 // Strategi: CacheFirst untuk aset statis & tile peta, NetworkFirst untuk API
 
-const CACHE_VERSION = "imosque-v1";
-const STATIC_CACHE = "imosque-static-v1";
-const TILE_CACHE = "imosque-tiles-v1";
-const API_CACHE = "imosque-api-v1";
+const CACHE_VERSION = "imosque-v2";
+const DEV_MODE = new URL(self.location.href).searchParams.get("dev") === "1";
+const STATIC_CACHE = `${CACHE_VERSION}-static`;
+const TILE_CACHE = `${CACHE_VERSION}-tiles`;
+const API_CACHE = `${CACHE_VERSION}-api`;
+const MAX_TILE_ENTRIES = 400;
+const MAX_STATIC_ENTRIES = 120;
 
 // Aset yang akan di-precache saat install
-const PRECACHE_URLS = [
-  "/",
-];
+const PRECACHE_URLS = DEV_MODE ? [] : ["/"];
 
 // === INSTALL ===
 self.addEventListener("install", (event) => {
@@ -60,10 +61,14 @@ self.addEventListener("fetch", (event) => {
   // 4. API Backend → NetworkFirst (data realtime, fallback ke cache jika offline)
   if (url.pathname.startsWith("/api/") || url.hostname === "127.0.0.1" || url.hostname === "localhost") {
     if (url.port === "8000" || url.pathname.startsWith("/api/")) {
-      event.respondWith(networkFirst(event.request, API_CACHE, 3000));
+      event.respondWith(networkFirst(event.request, API_CACHE, 6000));
       return;
     }
   }
+
+  // In development, leave Next.js/HMR/page requests untouched while still
+  // caching map tiles and backend GET APIs above.
+  if (DEV_MODE) return;
 
   // 3. Aset statis Next.js (_next/static/) → CacheFirst
   if (url.pathname.startsWith("/_next/static/")) {
@@ -102,7 +107,7 @@ async function cacheFirst(request, cacheName, maxAgeSeconds) {
     return cached;
   }
 
-  return fetchAndCache(request, cache);
+  return fetchAndCache(request, cache, cacheName === TILE_CACHE ? MAX_TILE_ENTRIES : MAX_STATIC_ENTRIES);
 }
 
 // NetworkFirst: Coba network dulu dengan timeout, fallback ke cache
@@ -117,14 +122,15 @@ async function networkFirst(request, cacheName, timeoutMs) {
       const headers = new Headers(cloned.headers);
       headers.set("sw-cache-date", new Date().toISOString());
       const body = await cloned.blob();
-      cache.put(request, new Response(body, {
+      await cache.put(request, new Response(body, {
         status: cloned.status,
         statusText: cloned.statusText,
         headers: headers,
       }));
+      await trimCache(cache, MAX_STATIC_ENTRIES);
     }
     return response;
-  } catch (err) {
+  } catch {
     const cached = await cache.match(request);
     return cached || new Response(JSON.stringify({ error: "Offline" }), {
       status: 503,
@@ -139,8 +145,8 @@ async function staleWhileRevalidate(request, cacheName) {
   const cached = await cache.match(request);
 
   const fetchPromise = fetch(request).then((response) => {
-    if (response.ok) {
-      cache.put(request, response.clone());
+    if (response.ok || response.type === "opaque") {
+      cache.put(request, response.clone()).then(() => trimCache(cache, MAX_STATIC_ENTRIES));
     }
     return response;
   }).catch(() => cached);
@@ -149,24 +155,39 @@ async function staleWhileRevalidate(request, cacheName) {
 }
 
 // Helper: Fetch dan simpan ke cache
-async function fetchAndCache(request, cache) {
+async function fetchAndCache(request, cache, maxEntries = MAX_STATIC_ENTRIES) {
   try {
     const response = await fetch(request);
-    if (response.ok) {
+    if (response.ok || response.type === "opaque") {
+      // Cross-origin map tiles arrive as opaque responses. They cannot be
+      // inspected/reconstructed, but CacheStorage can persist the clone.
+      if (response.type === "opaque") {
+        await cache.put(request, response.clone());
+        await trimCache(cache, maxEntries);
+        return response;
+      }
       const cloned = response.clone();
       const headers = new Headers(cloned.headers);
       headers.set("sw-cache-date", new Date().toISOString());
       const body = await cloned.blob();
-      cache.put(request, new Response(body, {
+      await cache.put(request, new Response(body, {
         status: cloned.status,
         statusText: cloned.statusText,
         headers: headers,
       }));
+      await trimCache(cache, maxEntries);
     }
     return response;
-  } catch (err) {
+  } catch {
     return new Response("Offline", { status: 503 });
   }
+}
+
+async function trimCache(cache, maxEntries) {
+  const keys = await cache.keys();
+  if (keys.length <= maxEntries) return;
+  const overflow = keys.length - maxEntries;
+  await Promise.all(keys.slice(0, overflow).map((key) => cache.delete(key)));
 }
 
 // Helper: Promise dengan timeout

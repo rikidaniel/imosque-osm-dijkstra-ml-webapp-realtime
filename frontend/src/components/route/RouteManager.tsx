@@ -108,12 +108,13 @@ export default function RouteManager() {
           longitude: startPoint.lng
         },
         algorithm: algorithm,
-        departure_time: `2026-07-11T${currentTime || '17:00'}:00+07:00`,
+        departure_time: `${new Date().toLocaleDateString("en-CA")}T${currentTime || '17:00'}:00+07:00`,
         prayer: prayer,
         profile: profile,
         maximum_results: parseInt(maxCandidates),
         search_radius_km: parseFloat(bufferKm),
         auto_build_osm: autoBuild,
+        compact_response: true,
       };
 
       const res = await fetch(`${API_BASE}/api/v1/routes/recommend`, {

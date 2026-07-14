@@ -1,12 +1,16 @@
+import copy
 import pandas as pd
 import io
 import re
+import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from app.domain.repositories.mosque_repo import MosqueRepository
 from app.domain.repositories.dataset_repo import DatasetRepository
 from app.infrastructure.services.ml_enrichment_service import MLEnrichmentService, slugify_dataset_name
-from app.infrastructure.services.osm_graph import DATA_DIR
+from app.infrastructure.services.osm_graph import DATA_DIR, evict_road_graph, get_graphml_path
 
 from fastapi import BackgroundTasks
 
@@ -14,6 +18,21 @@ class DatasetUseCases:
     def __init__(self, mosque_repo: MosqueRepository, dataset_repo: DatasetRepository):
         self.mosque_repo = mosque_repo
         self.dataset_repo = dataset_repo
+        self._nearest_cache: "OrderedDict[tuple, tuple[float, Dict[str, Any]]]" = OrderedDict()
+        self._nearest_cache_lock = threading.RLock()
+
+    def invalidate_osm_graph(self, dataset_id: str) -> None:
+        """Remove road cache derived from a dataset whose contents changed."""
+        did = slugify_dataset_name(dataset_id)
+        graph_path = get_graphml_path(did)
+        evict_road_graph(graph_path)
+        if graph_path.exists():
+            graph_path.unlink()
+        self.dataset_repo.delete_osm_cache(did)
+        with self._nearest_cache_lock:
+            stale_keys = [key for key in self._nearest_cache if key[0] == did]
+            for key in stale_keys:
+                self._nearest_cache.pop(key, None)
 
     def get_active_dataset_id(self) -> str:
         return self.dataset_repo.get_active_dataset_id()
@@ -92,7 +111,9 @@ class DatasetUseCases:
                     "message": "Menyimpan data masjid ke ArangoDB..."
                 })
                 
+                self.mosque_repo.delete_all_mosques(did)
                 self.mosque_repo.save_mosques(did, records)
+                self.invalidate_osm_graph(did)
                 
                 # Selesai! Update status ke completed
                 self.dataset_repo.upsert_dataset(did, profile)
@@ -158,17 +179,102 @@ class DatasetUseCases:
             "items": items
         }
 
+    def get_dataset_bbox(self, dataset_id: str) -> Dict[str, Any]:
+        """Calculate a robust bbox from every valid coordinate in a dataset."""
+        import math
+        import numpy as np
+
+        did = slugify_dataset_name(dataset_id)
+        total = self.mosque_repo.count_mosques(did)
+        if total == 0:
+            raise ValueError("Dataset tidak memiliki data masjid.")
+        mosques = self.mosque_repo.get_mosques(did, limit=total)
+        coords = []
+        for mosque in mosques:
+            try:
+                lat = float(mosque.get("latitude"))
+                lon = float(mosque.get("longitude"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(lat) and math.isfinite(lon) and -11.5 <= lat <= 6.5 and 94 <= lon <= 142.5:
+                coords.append((lat, lon))
+        if not coords:
+            raise ValueError("Dataset tidak memiliki koordinat valid.")
+
+        values = np.asarray(coords, dtype=float)
+        q1 = np.quantile(values, 0.25, axis=0)
+        q3 = np.quantile(values, 0.75, axis=0)
+        lower = q1 - 1.5 * (q3 - q1)
+        upper = q3 + 1.5 * (q3 - q1)
+        clean = values[np.all((values >= lower) & (values <= upper), axis=1)]
+        if len(clean) == 0:
+            clean = values
+
+        south, west = clean.min(axis=0)
+        north, east = clean.max(axis=0)
+        raw_area = abs(north - south) * 111.0 * abs(east - west) * 111.0 * max(math.cos(math.radians((north + south) / 2)), 0.2)
+        adjusted = bool(raw_area > 1100.0)
+        if adjusted:
+            center_lat, center_lon = np.median(clean, axis=0)
+            half_side_km = math.sqrt(1100.0) / 2.0
+            delta_lat = half_side_km / 111.0
+            delta_lon = half_side_km / (111.0 * max(math.cos(math.radians(center_lat)), 0.2))
+            north, south = center_lat + delta_lat, center_lat - delta_lat
+            east, west = center_lon + delta_lon, center_lon - delta_lon
+        else:
+            north, south, east, west = north + 0.02, south - 0.02, east + 0.02, west - 0.02
+
+        return {
+            "dataset_id": did,
+            "total_rows": total,
+            "valid_rows": int(len(values)),
+            "used_rows": int(len(clean)),
+            "ignored_outliers": int(len(values) - len(clean)),
+            "adjusted_to_area_limit": adjusted,
+            "raw_area_km2": round(float(raw_area), 2),
+            "bbox": {"north": float(north), "south": float(south), "east": float(east), "west": float(west)},
+        }
+
     def get_nearest_mosques(self, dataset_id: str, lat: float, lon: float, radius_km: float, limit: int = 10) -> Dict[str, Any]:
         # "all" = lintas semua dataset, jangan di-slugify menjadi filter yang salah
         did = dataset_id if (not dataset_id or dataset_id.lower() == "all") else slugify_dataset_name(dataset_id)
-        items = self.mosque_repo.get_nearest_mosques(did, lat, lon, radius_km, limit)
-        return {
+        max_radius = max(0.5, float(radius_km))
+        cache_key = (did, round(float(lat), 4), round(float(lon), 4), round(max_radius, 1), int(limit))
+        now = time.monotonic()
+        with self._nearest_cache_lock:
+            cached = self._nearest_cache.get(cache_key)
+            if cached and now - cached[0] <= 30.0:
+                self._nearest_cache.move_to_end(cache_key)
+                response = copy.deepcopy(cached[1])
+                response["origin"] = {"latitude": lat, "longitude": lon}
+                response["cache_hit"] = True
+                return response
+        radii = []
+        for candidate_radius in (5.0, 15.0, max_radius):
+            effective = min(candidate_radius, max_radius)
+            if effective not in radii:
+                radii.append(effective)
+        items = []
+        used_radius = radii[-1]
+        for current_radius in radii:
+            items = self.mosque_repo.get_nearest_mosques(did, lat, lon, current_radius, limit)
+            used_radius = current_radius
+            if len(items) >= limit:
+                break
+        response = {
             "dataset_id": did,
             "origin": {"latitude": lat, "longitude": lon},
-            "radius_km": radius_km,
+            "radius_km": max_radius,
+            "search_radius_used_km": used_radius,
             "total": len(items),
-            "items": items
+            "items": items,
+            "cache_hit": False,
         }
+        with self._nearest_cache_lock:
+            self._nearest_cache[cache_key] = (now, copy.deepcopy(response))
+            while len(self._nearest_cache) > 512:
+                self._nearest_cache.popitem(last=False)
+        return response
 
     def delete_mosque(self, dataset_id: str, mosque_id: str) -> bool:
         did = slugify_dataset_name(dataset_id)
@@ -179,6 +285,7 @@ class DatasetUseCases:
         
         # 1. Delete all mosques in dataset
         self.mosque_repo.delete_all_mosques(did)
+        self.invalidate_osm_graph(did)
         
         # 2. Delete raw CSV on disk if exists
         try:

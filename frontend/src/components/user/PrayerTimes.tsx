@@ -5,6 +5,7 @@ import { useAppStore } from "@/lib/store";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Bell, BellOff, Clock, MapPin, Volume2, VolumeX } from "lucide-react";
 import { toast } from "sonner";
+import { fetchPrayerTimes } from "@/lib/api";
 
 interface PrayerSchedule {
   name: string;
@@ -28,37 +29,39 @@ export default function PrayerTimes() {
 
   // Fetch real prayer times based on user coordinates if available
   useEffect(() => {
-    const fetchPrayerTimes = async () => {
+    const controller = new AbortController();
+    const loadPrayerTimes = async () => {
       const lat = startPoint?.lat ?? -6.2088; // Default Jakarta
       const lng = startPoint?.lng ?? 106.8456;
       const date = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD
 
       try {
-        const res = await fetch(
-          `https://api.aladhan.com/v1/timings/${date}?latitude=${lat}&longitude=${lng}&method=20` // Method 20 = Kemenag RI
-        );
-        if (!res.ok) throw new Error("Gagal mengambil jadwal");
-        const data = await res.json();
-        const timings = data.data.timings;
-        const hijri = data.data.date.hijri;
-        const gregorian = data.data.date.gregorian;
+        const data = await fetchPrayerTimes(lat, lng, date, controller.signal);
+        const timings = data.timings;
+        const dateObject = new Date(`${date}T12:00:00`);
+        setHijriDate(`${new Intl.DateTimeFormat("id-ID-u-ca-islamic", {
+          day: "numeric", month: "long", year: "numeric",
+        }).format(dateObject)} H`);
+        setMasehiDate(new Intl.DateTimeFormat("id-ID", {
+          day: "numeric", month: "long", year: "numeric",
+        }).format(dateObject));
 
-        setHijriDate(`${hijri.day} ${hijri.month.en} ${hijri.year} H`);
-        setMasehiDate(`${gregorian.day} ${gregorian.month.en} ${gregorian.year}`);
-
-        setSchedule([
-          { name: "Subuh", time: timings.Fajr, isAlarmActive: schedule[0].isAlarmActive },
-          { name: "Dzuhur", time: timings.Dhuhr, isAlarmActive: schedule[1].isAlarmActive },
-          { name: "Ashar", time: timings.Asr, isAlarmActive: schedule[2].isAlarmActive },
-          { name: "Maghrib", time: timings.Maghrib, isAlarmActive: schedule[3].isAlarmActive },
-          { name: "Isya", time: timings.Isha, isAlarmActive: schedule[4].isAlarmActive },
+        setSchedule((current) => [
+          { name: "Subuh", time: timings.Fajr, isAlarmActive: current[0]?.isAlarmActive ?? true },
+          { name: "Dzuhur", time: timings.Dhuhr, isAlarmActive: current[1]?.isAlarmActive ?? false },
+          { name: "Ashar", time: timings.Asr, isAlarmActive: current[2]?.isAlarmActive ?? false },
+          { name: "Maghrib", time: timings.Maghrib, isAlarmActive: current[3]?.isAlarmActive ?? true },
+          { name: "Isya", time: timings.Isha, isAlarmActive: current[4]?.isAlarmActive ?? false },
         ]);
       } catch (err) {
-        console.warn("Menggunakan jadwal sholat fallback:", err);
+        if (!controller.signal.aborted) {
+          console.warn("Menggunakan jadwal sholat fallback:", err);
+        }
       }
     };
 
-    fetchPrayerTimes();
+    loadPrayerTimes();
+    return () => controller.abort();
   }, [startPoint]);
 
   // Calculate countdown to next prayer

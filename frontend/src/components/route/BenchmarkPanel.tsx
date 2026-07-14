@@ -49,7 +49,7 @@ export default function BenchmarkPanel() {
           latitude: endPoint.lat,
           longitude: endPoint.lng
         },
-        departure_time: `2026-07-11T${currentTime}:00+07:00`,
+        departure_time: `${new Date().toLocaleDateString("en-CA")}T${currentTime}:00+07:00`,
         prayer: prayer,
         profile: profile,
         search_radius_km: parseFloat(bufferKm)

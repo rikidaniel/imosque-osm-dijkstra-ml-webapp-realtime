@@ -1,10 +1,9 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { MapContainer, TileLayer, Marker, Popup, Polyline, useMapEvents, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import { useTheme } from "next-themes";
 
 // Custom Markers
 let StartIcon: any = null;
@@ -67,44 +66,51 @@ function MapEvents({ onClick }: { onClick?: (e: L.LeafletMouseEvent) => void }) 
   return null;
 }
 
-function FitBounds({ bounds }: { bounds: [number, number][] | null }) {
+function FitBounds({ bounds, lowDataMode }: { bounds: [number, number][] | null; lowDataMode: boolean }) {
   const map = useMap();
-  const [prevBounds, setPrevBounds] = useState<string | null>(null);
+  const previousSignature = useRef<string | null>(null);
 
   useEffect(() => {
     if (bounds && bounds.length > 0) {
-      const boundsStr = JSON.stringify(bounds);
-      if (prevBounds !== boundsStr) {
+      const first = bounds[0];
+      const last = bounds[bounds.length - 1];
+      const boundsSignature = `${bounds.length}:${first.join(",")}:${last.join(",")}`;
+      if (previousSignature.current !== boundsSignature) {
         const isMobile = typeof window !== "undefined" && window.innerWidth < 768;
+        const sharedOptions = {
+          maxZoom: lowDataMode ? 15 : 16,
+          animate: !lowDataMode,
+        };
         if (isMobile) {
           // Berikan padding bawah 200px agar rute berada di paruh atas layar (tidak tertutup panel bawah)
           map.fitBounds(bounds as L.LatLngBoundsExpression, {
+            ...sharedOptions,
             paddingTopLeft: [24, 24],
             paddingBottomRight: [24, 200]
           });
         } else {
-          map.fitBounds(bounds as L.LatLngBoundsExpression, { padding: [50, 50] });
+          map.fitBounds(bounds as L.LatLngBoundsExpression, { ...sharedOptions, padding: [50, 50] });
         }
-        setPrevBounds(boundsStr);
+        previousSignature.current = boundsSignature;
       }
     }
-  }, [bounds, map, prevBounds]);
+  }, [bounds, lowDataMode, map]);
   return null;
 }
 
 function ChangeMapView({ center }: { center: [number, number] | undefined }) {
   const map = useMap();
-  const [prevCenter, setPrevCenter] = useState<[number, number] | null>(null);
+  const previousCenter = useRef<[number, number] | null>(null);
 
   useEffect(() => {
     if (center) {
-      const hasChanged = !prevCenter || prevCenter[0] !== center[0] || prevCenter[1] !== center[1];
+      const hasChanged = !previousCenter.current || previousCenter.current[0] !== center[0] || previousCenter.current[1] !== center[1];
       if (hasChanged) {
         map.setView(center, map.getZoom());
-        setPrevCenter(center);
+        previousCenter.current = center;
       }
     }
-  }, [center, map, prevCenter]);
+  }, [center, map]);
   return null;
 }
 
@@ -238,17 +244,16 @@ export default function MapComponent({
   routingMode?: string | null,
   onMapClick?: (e: L.LeafletMouseEvent) => void
 }) {
-  const { theme, resolvedTheme } = useTheme();
-  const currentTheme = theme === "system" ? resolvedTheme : theme;
   const [basemap, setBasemap] = useState("osm");
-
-  useEffect(() => {
-    if (currentTheme === "dark") {
-      setBasemap("dark");
-    } else {
-      setBasemap("osm");
-    }
-  }, [currentTheme]);
+  const [tilesLoading, setTilesLoading] = useState(false);
+  const [lowDataMode] = useState(() => {
+    if (typeof navigator === "undefined") return false;
+    const connection = (navigator as Navigator & {
+      connection?: { saveData?: boolean; effectiveType?: string }
+    }).connection;
+    return Boolean(connection?.saveData || connection?.effectiveType === "2g" || connection?.effectiveType === "slow-2g" || connection?.effectiveType === "3g");
+  });
+  const effectiveZoom = lowDataMode ? Math.min(zoom, 12) : zoom;
 
   const basemaps: Record<string, { url: string, name: string }> = {
     osm: {
@@ -273,14 +278,28 @@ export default function MapComponent({
     <div className="relative w-full h-full">
       <MapContainer 
         center={center} 
-        zoom={zoom} 
+        zoom={effectiveZoom}
         className="w-full h-full z-0"
         zoomControl={false}
+        preferCanvas
+        zoomAnimation={!lowDataMode}
+        fadeAnimation={!lowDataMode}
+        markerZoomAnimation={!lowDataMode}
       >
         <ChangeMapView center={center} />
         <TileLayer
           url={basemaps[basemap].url}
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          tileSize={lowDataMode ? 512 : 256}
+          zoomOffset={lowDataMode ? -1 : 0}
+          updateWhenIdle={lowDataMode}
+          updateWhenZooming={!lowDataMode}
+          keepBuffer={lowDataMode ? 0 : 2}
+          eventHandlers={{
+            loading: () => setTilesLoading(true),
+            load: () => setTilesLoading(false),
+            tileerror: () => setTilesLoading(false),
+          }}
         />
         
         {markers.map((marker, idx) => {
@@ -382,12 +401,18 @@ export default function MapComponent({
               return connectors;
             })()}
             
-            <FitBounds bounds={route} />
+            <FitBounds bounds={route} lowDataMode={lowDataMode} />
           </>
         )}
 
         <MapEvents onClick={onMapClick} />
       </MapContainer>
+
+      {tilesLoading && route && route.length > 0 && (
+        <div className="pointer-events-none absolute left-1/2 top-4 z-[1000] -translate-x-1/2 rounded-full border border-emerald-200 bg-white/95 px-3 py-1.5 text-[11px] font-semibold text-emerald-800 shadow-lg backdrop-blur dark:border-emerald-900 dark:bg-slate-900/95 dark:text-emerald-300">
+          Rute sudah siap · detail peta masih dimuat
+        </div>
+      )}
 
       {/* Floating Basemap Selector */}
       <div className="absolute bottom-4 right-4 z-[1000] bg-white/70 dark:bg-slate-900/75 backdrop-blur-md border border-slate-200/50 dark:border-slate-800/50 p-1.5 rounded-2xl shadow-xl flex gap-1 pointer-events-auto transition-all">

@@ -1,17 +1,15 @@
 "use client";
 
-import { useTheme } from "next-themes";
 import Link from "next/link";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Moon, Sun, Monitor, Shield, Settings, Volume2, Info } from "lucide-react";
+import { Shield, Settings, Volume2, Info } from "lucide-react";
 import { useState, useEffect } from "react";
 import { toast } from "sonner";
 
 export default function UserSettings() {
-  const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   const [soundOption, setSoundOption] = useState("makkah");
   const [highAccuracy, setHighAccuracy] = useState(true);
@@ -35,45 +33,8 @@ export default function UserSettings() {
           <CardDescription className="text-xs">Sesuaikan kebutuhan navigasi & ibadah Anda.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {/* Theme Selector */}
-          <div className="flex items-center justify-between">
-            <div className="flex flex-col gap-0.5">
-              <span className="text-sm font-semibold text-slate-700">Tema Aplikasi</span>
-              <span className="text-[11px] text-slate-500">Pilih tampilan antarmuka</span>
-            </div>
-            <div className="flex border rounded-lg overflow-hidden shrink-0 bg-slate-50 p-0.5">
-              <button
-                onClick={() => setTheme("light")}
-                className={`p-1.5 rounded-md transition-all ${
-                  theme === "light" ? "bg-white text-emerald-600 shadow-sm" : "text-slate-400 hover:text-slate-600"
-                }`}
-                title="Mode Terang"
-              >
-                <Sun className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => setTheme("dark")}
-                className={`p-1.5 rounded-md transition-all ${
-                  theme === "dark" ? "bg-slate-800 text-emerald-400 shadow-sm" : "text-slate-400 hover:text-slate-600"
-                }`}
-                title="Mode Gelap"
-              >
-                <Moon className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => setTheme("system")}
-                className={`p-1.5 rounded-md transition-all ${
-                  theme === "system" ? "bg-white text-emerald-600 shadow-sm" : "text-slate-400 hover:text-slate-600"
-                }`}
-                title="Ikuti Sistem"
-              >
-                <Monitor className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-
           {/* Adzan Sound */}
-          <div className="space-y-2 pt-2 border-t border-slate-100">
+          <div className="space-y-2">
             <div className="flex flex-col gap-0.5">
               <span className="text-sm font-semibold text-slate-700">Nada Alarm Adzan</span>
               <span className="text-[11px] text-slate-500">Pilih suara adzan untuk alarm sholat</span>
@@ -124,7 +85,7 @@ export default function UserSettings() {
       {/* Admin Panel Access Link */}
       <Card className="border-slate-100 shadow-sm rounded-2xl bg-slate-50/50">
         <CardHeader className="pb-3">
-          <CardTitle className="text-base font-bold flex items-center gap-2 text-slate-800 dark:text-slate-100">
+          <CardTitle className="text-base font-bold flex items-center gap-2 text-slate-800">
             <Shield className="w-4 h-4 text-emerald-600" />
             Area Administratif
           </CardTitle>

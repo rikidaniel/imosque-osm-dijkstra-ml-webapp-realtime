@@ -1,5 +1,8 @@
+import copy
+import hashlib
 import re
-from typing import Any, Dict, List, Optional
+import threading
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from app.domain.repositories.mosque_repo import MosqueRepository
 from app.domain.repositories.dataset_repo import DatasetRepository
 from app.infrastructure.database.arangodb_client import get_db
@@ -11,6 +14,21 @@ def _slugify_key(text: str) -> str:
     return s or "empty"
 
 class ArangoMosqueRepository(MosqueRepository):
+    _lookup_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+    _lookup_cache_lock = threading.RLock()
+    _lookup_cache_max_entries = 10000
+
+    @classmethod
+    def _cache_mosque(cls, mosque: Dict[str, Any]) -> None:
+        dataset_id = str(mosque.get("dataset_id") or "")
+        mosque_id = str(mosque.get("id") or "")
+        if not dataset_id or not mosque_id:
+            return
+        with cls._lookup_cache_lock:
+            if len(cls._lookup_cache) >= cls._lookup_cache_max_entries:
+                cls._lookup_cache.clear()
+            cls._lookup_cache[(dataset_id, mosque_id)] = copy.deepcopy(mosque)
+
     def save_mosques(self, dataset_id: str, mosques: List[Dict[str, Any]]) -> None:
         db = get_db()
         col = db.collection('Mosque')
@@ -22,6 +40,8 @@ class ArangoMosqueRepository(MosqueRepository):
             m['_key'] = f"{dataset_id}_{m.get('id', '')}"
             
         col.insert_many(mosques, overwrite=True)
+        for mosque in mosques:
+            self._cache_mosque(mosque)
         
         # Ingest graph structure
         provinces = {}
@@ -151,24 +171,51 @@ class ArangoMosqueRepository(MosqueRepository):
         return res[0] if res else 0
 
     def get_mosque_by_id(self, dataset_id: str, mosque_id: str) -> Optional[Dict[str, Any]]:
+        with self._lookup_cache_lock:
+            cached = self._lookup_cache.get((dataset_id, mosque_id))
+            if cached is not None:
+                return copy.deepcopy(cached)
         db = get_db()
         if dataset_id and dataset_id != "all":
             try:
-                return db.collection('Mosque').get(f"{dataset_id}_{mosque_id}")
+                mosque = db.collection('Mosque').get(f"{dataset_id}_{mosque_id}")
+                if mosque:
+                    self._cache_mosque(mosque)
+                return mosque
             except Exception:
                 pass
-        # Fallback: search across all mosques by the field 'id'
+        # Fallback uses persistent indexes and never returns an ID collision from
+        # another dataset when a dataset was explicitly selected.
         try:
-            query = "FOR m IN Mosque FILTER m.id == @m_id LIMIT 1 RETURN m"
-            cursor = db.aql.execute(query, bind_vars={"m_id": mosque_id})
+            if dataset_id and dataset_id != "all":
+                query = "FOR m IN Mosque FILTER m.dataset_id == @did AND m.id == @m_id LIMIT 1 RETURN m"
+                bind_vars = {"did": dataset_id, "m_id": mosque_id}
+            else:
+                query = "FOR m IN Mosque FILTER m.id == @m_id LIMIT 1 RETURN m"
+                bind_vars = {"m_id": mosque_id}
+            cursor = db.aql.execute(query, bind_vars=bind_vars)
             res = [doc for doc in cursor]
-            return res[0] if res else None
+            mosque = res[0] if res else None
+            if mosque:
+                self._cache_mosque(mosque)
+            return mosque
         except Exception:
             return None
 
-    def get_mosques_in_bounds(self, dataset_id: str, bounds: tuple[float, float, float, float]) -> List[Dict[str, Any]]:
+    def get_mosques_in_bounds(
+        self,
+        dataset_id: str,
+        bounds: tuple[float, float, float, float],
+        limit: int = 600,
+        anchors: Optional[Sequence[Tuple[float, float]]] = None,
+    ) -> List[Dict[str, Any]]:
         db = get_db()
         south, north, west, east = bounds
+        safe_limit = max(50, min(int(limit), 2000))
+        anchor_points = list(anchors or [])
+        start = anchor_points[0] if anchor_points else ((south + north) / 2, (west + east) / 2)
+        end = anchor_points[1] if len(anchor_points) > 1 else start
+        center = ((south + north) / 2, (west + east) / 2)
         
         polygon = {
             "type": "Polygon",
@@ -181,19 +228,43 @@ class ArangoMosqueRepository(MosqueRepository):
             ]]
         }
         
-        query = """
+        dataset_filter = "FILTER m.dataset_id == @did" if dataset_id and dataset_id != "all" else ""
+        query = f"""
         FOR m IN Mosque
-            FILTER m.dataset_id == @did
+            {dataset_filter}
             FILTER GEO_CONTAINS(@poly, m.coordinate)
-            SORT m.priority_score DESC
-            RETURN m
+            LET anchor_distance = MIN([
+                GEO_DISTANCE(@start, m.coordinate),
+                GEO_DISTANCE(@end, m.coordinate),
+                GEO_DISTANCE(@center, m.coordinate)
+            ])
+            SORT anchor_distance ASC, m.priority_score DESC
+            LIMIT @limit
+            RETURN {{
+                id: m.id, dataset_id: m.dataset_id, name: m.name,
+                address: m.address, province: m.province, provinsi: m.provinsi,
+                kabko: m.kabko, kecamatan: m.kecamatan, kelurahan: m.kelurahan,
+                latitude: m.latitude, longitude: m.longitude, coordinate: m.coordinate,
+                rating: m.rating, review_count: m.review_count,
+                facilities: m.facilities, fasilitas: m.fasilitas,
+                capacity_proxy: m.capacity_proxy, priority_score: m.priority_score,
+                tier: m.tier
+            }}
         """
         bind_vars = {
-            "did": dataset_id,
-            "poly": polygon
+            "poly": polygon,
+            "limit": safe_limit,
+            "start": [float(start[1]), float(start[0])],
+            "end": [float(end[1]), float(end[0])],
+            "center": [float(center[1]), float(center[0])],
         }
+        if dataset_filter:
+            bind_vars["did"] = dataset_id
         cursor = db.aql.execute(query, bind_vars=bind_vars)
-        return [doc for doc in cursor]
+        mosques = [doc for doc in cursor]
+        for mosque in mosques:
+            self._cache_mosque(mosque)
+        return mosques
 
     def get_nearest_mosques(self, dataset_id: str, lat: float, lon: float, radius_km: float, limit: int = 100) -> List[Dict[str, Any]]:
         db = get_db()
@@ -201,11 +272,20 @@ class ArangoMosqueRepository(MosqueRepository):
             query = """
             FOR m IN Mosque
                 FILTER m.dataset_id == @did
-                FILTER GEO_DISTANCE([@lon, @lat], m.coordinate) <= @radius_m
                 LET dist = GEO_DISTANCE([@lon, @lat], m.coordinate)
+                FILTER dist <= @radius_m
                 SORT dist ASC
                 LIMIT @limit
-                RETURN MERGE(m, {distance_km: dist / 1000})
+                RETURN {
+                    id: m.id, dataset_id: m.dataset_id, name: m.name,
+                    address: m.address, provinsi: m.provinsi, kabko: m.kabko,
+                    kecamatan: m.kecamatan, kelurahan: m.kelurahan,
+                    latitude: m.latitude, longitude: m.longitude,
+                    rating: m.rating, review_count: m.review_count,
+                    facilities: m.facilities, fasilitas: m.fasilitas,
+                    capacity_proxy: m.capacity_proxy, priority_score: m.priority_score,
+                    tier: m.tier, distance_km: dist / 1000
+                }
             """
             bind_vars = {
                 "did": dataset_id,
@@ -217,11 +297,20 @@ class ArangoMosqueRepository(MosqueRepository):
         else:
             query = """
             FOR m IN Mosque
-                FILTER GEO_DISTANCE([@lon, @lat], m.coordinate) <= @radius_m
                 LET dist = GEO_DISTANCE([@lon, @lat], m.coordinate)
+                FILTER dist <= @radius_m
                 SORT dist ASC
                 LIMIT @limit
-                RETURN MERGE(m, {distance_km: dist / 1000})
+                RETURN {
+                    id: m.id, dataset_id: m.dataset_id, name: m.name,
+                    address: m.address, provinsi: m.provinsi, kabko: m.kabko,
+                    kecamatan: m.kecamatan, kelurahan: m.kelurahan,
+                    latitude: m.latitude, longitude: m.longitude,
+                    rating: m.rating, review_count: m.review_count,
+                    facilities: m.facilities, fasilitas: m.fasilitas,
+                    capacity_proxy: m.capacity_proxy, priority_score: m.priority_score,
+                    tier: m.tier, distance_km: dist / 1000
+                }
             """
             bind_vars = {
                 "lat": lat,
@@ -230,13 +319,18 @@ class ArangoMosqueRepository(MosqueRepository):
                 "limit": limit
             }
         cursor = db.aql.execute(query, bind_vars=bind_vars)
-        return [doc for doc in cursor]
+        mosques = [doc for doc in cursor]
+        for mosque in mosques:
+            self._cache_mosque(mosque)
+        return mosques
 
     def delete_mosque(self, dataset_id: str, mosque_id: str) -> bool:
         db = get_db()
         key = f"{dataset_id}_{mosque_id}"
         try:
             db.collection('Mosque').delete(key)
+            with self._lookup_cache_lock:
+                self._lookup_cache.pop((dataset_id, mosque_id), None)
             db.aql.execute("""
                 FOR edge IN LOCATED_IN_VILLAGE
                     FILTER edge._from == @m_id
@@ -282,6 +376,10 @@ class ArangoMosqueRepository(MosqueRepository):
                     FILTER edge._from == m_id
                     REMOVE edge IN LOCATED_IN_VILLAGE
         """, bind_vars={"did": dataset_id})
+        with self._lookup_cache_lock:
+            stale_keys = [key for key in self._lookup_cache if key[0] == dataset_id]
+            for key in stale_keys:
+                self._lookup_cache.pop(key, None)
 
     def create_mosque(self, dataset_id: str, data: Dict[str, Any]) -> str:
         db = get_db()
@@ -356,12 +454,24 @@ class ArangoDatasetRepository(DatasetRepository):
 
     def save_osm_cache(self, cache_id: str, data: Dict[str, Any]) -> None:
         db = get_db()
-        data['_key'] = cache_id
+        graph_id = str(cache_id or "latest")
+        graph_prefix = hashlib.sha1(graph_id.encode("utf-8")).hexdigest()[:16]
+        ingest_graph = bool(data.pop("ingest_graph", True))
+        data = {**data, '_key': graph_id, 'graph_id': graph_id}
         if 'graphml_path' in data and data['graphml_path'] is not None:
             data['graphml_path'] = str(data['graphml_path'])
-        db.collection('osm_graph_cache').insert(data, overwrite=True)
         
-        # Ingest road nodes and road connections to ArangoDB collections
+        # Routing reads GraphML directly. Large administrative-area builds can
+        # therefore publish metadata immediately without blocking on a second,
+        # redundant copy of every road node and edge in ArangoDB.
+        if not ingest_graph:
+            data['ingested_nodes'] = 0
+            data['ingested_edges'] = 0
+            data['sync_status'] = 'file_only'
+            db.collection('osm_graph_cache').insert(data, overwrite=True)
+            return
+
+        # Optional full graph mirror for installations that query roads in ArangoDB.
         try:
             from app.infrastructure.services.osm_graph import load_road_graph
             from pathlib import Path
@@ -373,7 +483,9 @@ class ArangoDatasetRepository(DatasetRepository):
                 nodes_to_insert = []
                 for node_id, node_data in G.nodes(data=True):
                     nodes_to_insert.append({
-                        "_key": str(node_id),
+                        "_key": f"{graph_prefix}_{node_id}",
+                        "osm_node_id": str(node_id),
+                        "graph_id": graph_id,
                         "latitude": float(node_data.get("y", 0.0)),
                         "longitude": float(node_data.get("x", 0.0)),
                         "coordinate": [float(node_data.get("x", 0.0)), float(node_data.get("y", 0.0))]
@@ -381,23 +493,44 @@ class ArangoDatasetRepository(DatasetRepository):
                 
                 # Batch save edges
                 edges_to_insert = []
-                for u, v, key, edge_data in G.edges(keys=True, data=True):
+                edge_iter = (
+                    G.edges(keys=True, data=True)
+                    if G.is_multigraph()
+                    else ((u, v, 0, attrs) for u, v, attrs in G.edges(data=True))
+                )
+                for u, v, key, edge_data in edge_iter:
                     edges_to_insert.append({
-                        "_key": f"{u}_{v}_{key}",
-                        "_from": f"RoadNode/{u}",
-                        "_to": f"RoadNode/{v}",
+                        "_key": f"{graph_prefix}_{u}_{v}_{key}",
+                        "_from": f"RoadNode/{graph_prefix}_{u}",
+                        "_to": f"RoadNode/{graph_prefix}_{v}",
+                        "graph_id": graph_id,
                         "length": float(edge_data.get("length", 0.0)),
                         "travel_time": float(edge_data.get("travel_time", 0.0))
                     })
                 
-                # Insert in batches
-                if nodes_to_insert:
-                    db.collection('RoadNode').insert_many(nodes_to_insert, overwrite=True)
-                if edges_to_insert:
-                    db.collection('ROAD_CONNECTION').insert_many(edges_to_insert, overwrite=True)
+                db.aql.execute("""
+                    FOR e IN ROAD_CONNECTION
+                        FILTER e.graph_id == @graph_id OR e.graph_id == null
+                        REMOVE e IN ROAD_CONNECTION
+                """, bind_vars={"graph_id": graph_id})
+                db.aql.execute("""
+                    FOR n IN RoadNode
+                        FILTER n.graph_id == @graph_id OR n.graph_id == null
+                        REMOVE n IN RoadNode
+                """, bind_vars={"graph_id": graph_id})
+
+                batch_size = 10000
+                for start in range(0, len(nodes_to_insert), batch_size):
+                    db.collection('RoadNode').insert_many(nodes_to_insert[start:start + batch_size], overwrite=True)
+                for start in range(0, len(edges_to_insert), batch_size):
+                    db.collection('ROAD_CONNECTION').insert_many(edges_to_insert[start:start + batch_size], overwrite=True)
+
+                data['ingested_nodes'] = len(nodes_to_insert)
+                data['ingested_edges'] = len(edges_to_insert)
+                data['sync_status'] = 'completed'
+                db.collection('osm_graph_cache').insert(data, overwrite=True)
         except Exception as exc:
-            import sys
-            print(f"Gagal menyimpan graph jalan ke ArangoDB: {exc}", file=sys.stderr)
+            raise RuntimeError(f"Gagal menyinkronkan graph jalan ke ArangoDB: {exc}") from exc
 
     def get_osm_cache(self, cache_id: str = "latest") -> Optional[Dict[str, Any]]:
         db = get_db()
@@ -405,6 +538,25 @@ class ArangoDatasetRepository(DatasetRepository):
             return db.collection('osm_graph_cache').get(cache_id)
         except Exception:
             return None
+
+    def delete_osm_cache(self, cache_id: str) -> None:
+        db = get_db()
+        graph_id = str(cache_id or "latest")
+        db.aql.execute("""
+            FOR e IN ROAD_CONNECTION
+                FILTER e.graph_id == @graph_id
+                REMOVE e IN ROAD_CONNECTION
+        """, bind_vars={"graph_id": graph_id})
+        db.aql.execute("""
+            FOR n IN RoadNode
+                FILTER n.graph_id == @graph_id
+                REMOVE n IN RoadNode
+        """, bind_vars={"graph_id": graph_id})
+        try:
+            db.collection('osm_graph_cache').delete(graph_id, ignore_missing=True)
+        except TypeError:
+            if db.collection('osm_graph_cache').has(graph_id):
+                db.collection('osm_graph_cache').delete(graph_id)
 
     def delete_dataset(self, dataset_id: str) -> bool:
         db = get_db()

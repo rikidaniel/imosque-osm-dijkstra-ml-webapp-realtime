@@ -31,5 +31,9 @@ class DatasetRepository(ABC):
         pass
 
     @abstractmethod
+    def delete_osm_cache(self, cache_id: str) -> None:
+        pass
+
+    @abstractmethod
     def delete_dataset(self, dataset_id: str) -> bool:
         pass

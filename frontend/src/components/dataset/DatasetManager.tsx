@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useCallback, useEffect, useState, useRef } from "react";
 import { useAppStore } from "@/lib/store";
-import { fetchDatasets, deleteDataset, fetchDatasetStatus, buildOsmBbox, fetchMosques } from "@/lib/api";
+import { buildAllOsmGraphs, cancelBuildAllOsm, fetchBuildAllOsmStatus, fetchDatasets, deleteDataset, fetchDatasetStatus, buildOsmBbox, fetchDatasetBbox } from "@/lib/api";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -12,6 +12,28 @@ import { toast } from "sonner";
 const API_BASE = typeof window !== "undefined"
   ? `http://${window.location.hostname}:8000`
   : "http://127.0.0.1:8000";
+
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
+
+type GraphBuildItem = {
+  dataset_id: string;
+  label: string;
+  status: string;
+  message: string;
+  size_mb?: number;
+};
+
+type GraphBuildStatus = {
+  status: string;
+  total: number;
+  completed: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  available_graphs?: number;
+  total_datasets?: number;
+  items: GraphBuildItem[];
+};
 
 export default function DatasetManager() {
   const { datasets, setDatasets } = useAppStore();
@@ -26,6 +48,7 @@ export default function DatasetManager() {
   const [progressMessage, setProgressMessage] = useState<string>("");
 
   const [osmLoading, setOsmLoading] = useState(false);
+  const [bulkGraphStatus, setBulkGraphStatus] = useState<GraphBuildStatus | null>(null);
   const [north, setNorth] = useState("-6.08");
   const [south, setSouth] = useState("-6.37");
   const [east, setEast] = useState("106.97");
@@ -34,23 +57,13 @@ export default function DatasetManager() {
 
   const [selectedDatasetPreset, setSelectedDatasetPreset] = useState<string>("");
   const [detectingBbox, setDetectingBbox] = useState(false);
+  const bulkGraphRunning = bulkGraphStatus?.status === "running" || bulkGraphStatus?.status === "starting" || bulkGraphStatus?.status === "cancelling";
 
   const calculateAreaKm2 = (n: number, s: number, e: number, w: number): number => {
     const midLat = (n + s) / 2.0;
     const heightKm = Math.abs(n - s) * 111.0;
     const widthKm = Math.abs(e - w) * 111.0 * Math.max(Math.cos(midLat * Math.PI / 180.0), 0.2);
     return heightKm * widthKm;
-  };
-
-  const filterOutliers = (arr: number[]): number[] => {
-    if (arr.length < 4) return arr;
-    const sorted = [...arr].sort((a, b) => a - b);
-    const q1 = sorted[Math.floor(sorted.length * 0.25)];
-    const q3 = sorted[Math.floor(sorted.length * 0.75)];
-    const iqr = q3 - q1;
-    const lowerBound = q1 - 1.5 * iqr;
-    const upperBound = q3 + 1.5 * iqr;
-    return arr.filter(x => x >= lowerBound && x <= upperBound);
   };
 
   const handleDatasetPresetChange = async (datasetId: string) => {
@@ -60,78 +73,32 @@ export default function DatasetManager() {
     setDetectingBbox(true);
     const loadingToast = toast.loading("Menganalisis koordinat geospasial masjid pada dataset untuk menentukan Bounding Box otomatis...");
     try {
-      const res = await fetchMosques(datasetId, 2000);
-      const mosquesList = res.items || [];
-      
-      const lats = mosquesList.map((m: any) => parseFloat(m.latitude)).filter((l: number) => !isNaN(l) && l !== 0);
-      const lons = mosquesList.map((m: any) => parseFloat(m.longitude)).filter((l: number) => !isNaN(l) && l !== 0);
-      
-      if (lats.length === 0 || lons.length === 0) {
-        toast.dismiss(loadingToast);
-        toast.error("Dataset terpilih tidak memiliki data koordinat masjid yang valid.");
-        return;
-      }
-      
-      const filteredLats = filterOutliers(lats);
-      const filteredLons = filterOutliers(lons);
-      
-      if (filteredLats.length === 0 || filteredLons.length === 0) {
-        toast.dismiss(loadingToast);
-        toast.error("Tidak ada data koordinat bersih setelah pemfilteran outlier.");
-        return;
-      }
-      
-      const maxLat = Math.max(...filteredLats);
-      const minLat = Math.min(...filteredLats);
-      const maxLon = Math.max(...filteredLons);
-      const minLon = Math.min(...filteredLons);
-      
-      const rawArea = calculateAreaKm2(maxLat, minLat, maxLon, minLon);
-      
-      if (rawArea > 1200) {
-        // Hitung centroid (titik pusat sebaran)
-        const centerLat = filteredLats.reduce((sum, val) => sum + val, 0) / filteredLats.length;
-        const centerLon = filteredLons.reduce((sum, val) => sum + val, 0) / filteredLons.length;
-        
-        // Hitung rentang derajat untuk luas area 1100 km2 (sisi ~33.16 km, radius setengah sisi ~16.58 km)
-        const halfSideKm = 16.58;
-        const deltaLat = halfSideKm / 111.0;
-        const cosLat = Math.max(Math.cos(centerLat * Math.PI / 180.0), 0.2);
-        const deltaLon = halfSideKm / (111.0 * cosLat);
-        
-        const finalNorth = centerLat + deltaLat;
-        const finalSouth = centerLat - deltaLat;
-        const finalEast = centerLon + deltaLon;
-        const finalWest = centerLon - deltaLon;
-        
-        setNorth(finalNorth.toFixed(4));
-        setSouth(finalSouth.toFixed(4));
-        setEast(finalEast.toFixed(4));
-        setWest(finalWest.toFixed(4));
-        
-        toast.dismiss(loadingToast);
-        toast.warning(
-          `Dataset terlalu luas (${Math.round(rawArea)} km²). Area otomatis disesuaikan ke area terpadat (${Math.round(calculateAreaKm2(finalNorth, finalSouth, finalEast, finalWest))} km²) di pusat wilayah agar dapat diunduh.`
-        );
-      } else {
-        const buffer = 0.02;
-        setNorth((maxLat + buffer).toFixed(4));
-        setSouth((minLat - buffer).toFixed(4));
-        setEast((maxLon + buffer).toFixed(4));
-        setWest((minLon - buffer).toFixed(4));
-        
-        toast.dismiss(loadingToast);
-        toast.success(`Bounding Box berhasil dihitung secara otomatis berdasarkan ${filteredLats.length} masjid! (Mengabaikan ${lats.length - filteredLats.length} pencilan kotor)`);
-      }
-    } catch (err: any) {
+      const res = await fetchDatasetBbox(datasetId);
+      const bbox = res.bbox;
+      setNorth(bbox.north.toFixed(4));
+      setSouth(bbox.south.toFixed(4));
+      setEast(bbox.east.toFixed(4));
+      setWest(bbox.west.toFixed(4));
       toast.dismiss(loadingToast);
-      toast.error(`Gagal menghitung bounding box: ${err.message}`);
+      const detail = `${res.used_rows} dari ${res.valid_rows} koordinat dipakai; ${res.ignored_outliers} pencilan diabaikan.`;
+      if (res.adjusted_to_area_limit) {
+        toast.warning(`Dataset terlalu luas (${Math.round(res.raw_area_km2)} km²). Area dipusatkan dan dibatasi agar aman diunduh. ${detail}`);
+      } else {
+        toast.success(`Bounding box dihitung dari seluruh dataset. ${detail}`);
+      }
+    } catch (err: unknown) {
+      toast.dismiss(loadingToast);
+      toast.error(`Gagal menghitung bounding box: ${errorMessage(err)}`);
     } finally {
       setDetectingBbox(false);
     }
   };
 
   const handleBuildOsm = async () => {
+    if (!selectedDatasetPreset) {
+      toast.error("Pilih dataset terlebih dahulu agar graph disimpan dengan ID dataset yang benar.");
+      return;
+    }
     const n = parseFloat(north);
     const s = parseFloat(south);
     const e = parseFloat(east);
@@ -142,9 +109,14 @@ export default function DatasetManager() {
       return;
     }
 
+    if (s >= n || w >= e || s < -90 || n > 90 || w < -180 || e > 180) {
+      toast.error("Bounding box tidak valid: pastikan South < North dan West < East.");
+      return;
+    }
+
     const area = calculateAreaKm2(n, s, e, w);
-    if (area > 1200) {
-      toast.error(`Area Bounding Box terlalu besar (${Math.round(area)} km²). Batas maksimal download peta real-time adalah 1200 km². Silakan kecilkan area koordinat Anda (misalnya hanya mencakup satu wilayah kota/kabupaten saja).`);
+    if (area > 1500) {
+      toast.error(`Area Bounding Box terlalu besar (${Math.round(area)} km²). Batas maksimal satu build adalah 1500 km². Silakan kecilkan area koordinat Anda.`);
       return;
     }
 
@@ -154,40 +126,74 @@ export default function DatasetManager() {
       const res = await buildOsmBbox(n, s, e, w, networkType, selectedDatasetPreset);
       toast.dismiss(loadingToast);
       toast.success(res.message || "OSM road graph lokal berhasil dibangun!");
-    } catch (err: any) {
+    } catch (err: unknown) {
       toast.dismiss(loadingToast);
-      toast.error(err.message || "Gagal membangun graph OSM.");
+      toast.error(errorMessage(err) || "Gagal membangun graph OSM.");
     } finally {
       setOsmLoading(false);
     }
   };
 
-  const applyPreset = (presetName: string) => {
-    if (presetName === "dki_jakarta") {
-      setNorth("-6.08");
-      setSouth("-6.37");
-      setEast("106.97");
-      setWest("106.68");
-    } else if (presetName === "bandung") {
-      setNorth("-6.85");
-      setSouth("-6.98");
-      setEast("107.67");
-      setWest("107.55");
-    }
-  };
-
-  const loadDatasets = async () => {
+  const loadDatasets = useCallback(async () => {
     try {
       const data = await fetchDatasets();
       setDatasets(data.items || []);
-    } catch (err: any) {
-      toast.error(`Gagal memuat daftar dataset: ${err.message}`);
+    } catch (err: unknown) {
+      toast.error(`Gagal memuat daftar dataset: ${errorMessage(err)}`);
     }
-  };
+  }, [setDatasets]);
 
   useEffect(() => {
     loadDatasets();
+  }, [loadDatasets]);
+
+  useEffect(() => {
+    let mounted = true;
+    const refresh = async () => {
+      try {
+        const status = await fetchBuildAllOsmStatus() as GraphBuildStatus;
+        if (mounted) setBulkGraphStatus(status);
+      } catch {
+        // Status build bukan dependency kritis halaman admin.
+      }
+    };
+    refresh();
+    return () => {
+      mounted = false;
+    };
   }, []);
+
+  useEffect(() => {
+    if (!bulkGraphRunning) return;
+    const interval = window.setInterval(async () => {
+      try {
+        setBulkGraphStatus(await fetchBuildAllOsmStatus());
+      } catch {
+        // Pertahankan progres terakhir jika polling sementara gagal.
+      }
+    }, 2000);
+    return () => window.clearInterval(interval);
+  }, [bulkGraphRunning]);
+
+  const handleBuildAllGraphs = async () => {
+    try {
+      await buildAllOsmGraphs(networkType, false);
+      toast.success("Build graph semua dataset dimulai di background.");
+      setBulkGraphStatus(await fetchBuildAllOsmStatus());
+    } catch (err: unknown) {
+      toast.error(errorMessage(err));
+    }
+  };
+
+  const handleCancelBuildAll = async () => {
+    try {
+      const result = await cancelBuildAllOsm();
+      toast.info(result.message);
+      setBulkGraphStatus(await fetchBuildAllOsmStatus());
+    } catch (err: unknown) {
+      toast.error(errorMessage(err));
+    }
+  };
 
   const handleDeleteDataset = async (datasetId: string) => {
     setLoading(true);
@@ -196,8 +202,8 @@ export default function DatasetManager() {
       await deleteDataset(datasetId);
       toast.success(`Dataset ${datasetId} berhasil dihapus.`);
       await loadDatasets();
-    } catch (err: any) {
-      toast.error(`Gagal menghapus dataset: ${err.message}`);
+    } catch (err: unknown) {
+      toast.error(`Gagal menghapus dataset: ${errorMessage(err)}`);
     } finally {
       setLoading(false);
     }
@@ -212,6 +218,10 @@ export default function DatasetManager() {
   };
 
   const handleUpload = () => {
+    if (bulkGraphRunning) {
+      toast.error("Tunggu build graph selesai atau batalkan antreannya sebelum upload.");
+      return;
+    }
     if (!selectedFile) return;
     setLoading(true);
     setUploadingDatasetId("uploading");
@@ -267,14 +277,14 @@ export default function DatasetManager() {
                 toast.error(`Gagal memproses dataset: ${statusRes.message}`);
                 await loadDatasets();
               }
-            } catch (err: any) {
+            } catch (err: unknown) {
               clearInterval(interval);
               setUploadingDatasetId(null);
               setLoading(false);
-              toast.error(`Gagal mengambil status: ${err.message}`);
+              toast.error(`Gagal mengambil status: ${errorMessage(err)}`);
             }
           }, 1500);
-        } catch (e) {
+        } catch {
           toast.error("Gagal membaca respon pemrosesan server.");
           setLoading(false);
           setUploadingDatasetId(null);
@@ -360,7 +370,7 @@ export default function DatasetManager() {
                         size="icon" 
                         className="h-7 w-7 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg"
                         onClick={() => setDatasetToDelete(d.dataset_id)}
-                        disabled={loading}
+                        disabled={loading || bulkGraphRunning}
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </Button>
@@ -403,7 +413,7 @@ export default function DatasetManager() {
           
           <Button 
             className="w-full mt-4" 
-            disabled={!selectedFile || loading} 
+            disabled={!selectedFile || loading || bulkGraphRunning}
             onClick={handleUpload}
           >
             {loading ? (uploadingDatasetId ? "Memproses..." : "Mengunggah...") : "Upload & Jalankan ML"}
@@ -432,22 +442,53 @@ export default function DatasetManager() {
         <CardHeader>
           <CardTitle>Bangun Graph OSM Lokal</CardTitle>
           <CardDescription>
-            Download dan bangun graph jalan raya dari OpenStreetMap secara lokal untuk mempercepat pencarian rute Dijkstra/A* (&lt; 50ms).
+            Bangun cache jalan OpenStreetMap per dataset. Area di luar cache tetap dilayani melalui fallback OSRM.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex flex-wrap gap-2 mb-2">
-            <span className="text-xs font-semibold text-slate-500 self-center">Preset Cepat:</span>
-            <Button variant="outline" size="sm" className="text-xs h-8 rounded-lg" onClick={() => applyPreset("dki_jakarta")}>
-              DKI Jakarta
-            </Button>
-            <Button variant="outline" size="sm" className="text-xs h-8 rounded-lg" onClick={() => applyPreset("bandung")}>
-              Kota Bandung
-            </Button>
+          <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-4 dark:border-emerald-900/60 dark:bg-emerald-950/20">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-bold text-emerald-900 dark:text-emerald-200">Graph Area Prioritas Semua Dataset</p>
+                <p className="mt-1 text-xs leading-relaxed text-emerald-800/80 dark:text-emerald-300/70">
+                  Setiap dataset diproses satu per satu hingga batas area aman; ini bukan seluruh provinsi untuk dataset yang sangat luas.
+                  {bulkGraphStatus ? ` ${bulkGraphStatus.available_graphs ?? 0} dari ${bulkGraphStatus.total_datasets ?? datasets.length} graph dataset tersedia saat ini.` : ""}
+                </p>
+              </div>
+              {bulkGraphRunning ? (
+                <Button className="shrink-0" variant="outline" size="sm" onClick={handleCancelBuildAll}>Batalkan Antrean</Button>
+              ) : (
+                <Button className="shrink-0" size="sm" onClick={handleBuildAllGraphs} disabled={osmLoading || loading || datasets.length === 0}>
+                  Bangun Semua Area Prioritas
+                </Button>
+              )}
+            </div>
+
+            {bulkGraphStatus && bulkGraphStatus.total > 0 && (
+              <div className="mt-4 space-y-2">
+                <div className="flex justify-between gap-3 text-xs font-semibold text-slate-600 dark:text-slate-300">
+                  <span>{bulkGraphStatus.completed}/{bulkGraphStatus.total} dataset · {bulkGraphStatus.succeeded} berhasil · {bulkGraphStatus.skipped} tersedia · {bulkGraphStatus.failed} gagal</span>
+                  <span>{Math.round((bulkGraphStatus.completed / bulkGraphStatus.total) * 100)}%</span>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-white dark:bg-slate-800">
+                  <div className="h-full rounded-full bg-emerald-500 transition-all" style={{ width: `${(bulkGraphStatus.completed / bulkGraphStatus.total) * 100}%` }} />
+                </div>
+                <div className="max-h-32 space-y-1 overflow-y-auto text-[11px] text-slate-600 dark:text-slate-400">
+                  {bulkGraphStatus.items.map((item) => (
+                    <div key={item.dataset_id} className="flex items-center justify-between gap-3">
+                      <span className="truncate" title={item.label}>{item.label}</span>
+                      <span className={item.status === "failed" ? "text-rose-600" : item.status === "completed" ? "text-emerald-600" : ""}>
+                        {item.message}{item.size_mb ? ` · ${item.size_mb} MB` : ""}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-xs font-bold text-slate-500 dark:text-slate-400">Deteksi Area dari Dataset Terunggah</label>
+            <label className="text-xs font-bold text-slate-500 dark:text-slate-400">Dataset Tujuan dan Deteksi Area Otomatis</label>
             <select
               value={selectedDatasetPreset}
               onChange={(e) => handleDatasetPresetChange(e.target.value)}
@@ -525,7 +566,7 @@ export default function DatasetManager() {
 
           <Button 
             className="w-full mt-2" 
-            disabled={osmLoading || loading} 
+            disabled={osmLoading || loading || bulkGraphRunning}
             onClick={handleBuildOsm}
           >
             {osmLoading ? "Membangun Graph..." : "Download & Bangun Graph Jalan"}
@@ -553,7 +594,7 @@ export default function DatasetManager() {
             <Button variant="outline" onClick={() => setDatasetToDelete(null)} disabled={loading}>
               Batal
             </Button>
-            <Button variant="destructive" onClick={() => datasetToDelete && handleDeleteDataset(datasetToDelete)} disabled={loading}>
+            <Button variant="destructive" onClick={() => datasetToDelete && handleDeleteDataset(datasetToDelete)} disabled={loading || bulkGraphRunning}>
               {loading ? "Menghapus..." : "Hapus Dataset"}
             </Button>
           </DialogFooter>

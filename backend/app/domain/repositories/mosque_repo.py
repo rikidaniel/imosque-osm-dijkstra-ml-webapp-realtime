@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 class MosqueRepository(ABC):
     @abstractmethod
@@ -19,7 +19,13 @@ class MosqueRepository(ABC):
         pass
         
     @abstractmethod
-    def get_mosques_in_bounds(self, dataset_id: str, bounds: tuple[float, float, float, float]) -> List[Dict[str, Any]]:
+    def get_mosques_in_bounds(
+        self,
+        dataset_id: str,
+        bounds: tuple[float, float, float, float],
+        limit: int = 600,
+        anchors: Optional[Sequence[Tuple[float, float]]] = None,
+    ) -> List[Dict[str, Any]]:
         pass
         
     @abstractmethod

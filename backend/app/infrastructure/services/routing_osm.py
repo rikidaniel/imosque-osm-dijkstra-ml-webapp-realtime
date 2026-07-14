@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import datetime as dt
+import copy
+import heapq
 import math
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import re
 import networkx as nx
 import requests
+from requests.adapters import HTTPAdapter
 
 from typing import Callable
 
@@ -25,6 +30,7 @@ from .osm_graph import (
     haversine_km,
     load_road_graph,
     nearest_road_node,
+    nearest_road_nodes_batch,
     path_length_m,
     path_travel_time_s,
     route_nodes_to_latlon,
@@ -33,6 +39,17 @@ from .osm_graph import (
 Coordinate = Tuple[float, float]
 OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving"
 MAX_INLINE_AUTO_BUILD_AREA_KM2 = 90.0
+ROUTE_CACHE_TTL_SECONDS = 24 * 60 * 60
+ROUTE_CACHE_MAX_ENTRIES = 256
+CONNECTOR_SPEED_MPS = 5.56  # 20 km/h for short GPS/building-to-road access links
+
+_OSRM_SESSION = requests.Session()
+_OSRM_ADAPTER = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
+_OSRM_SESSION.mount("https://", _OSRM_ADAPTER)
+_OSRM_SESSION.mount("http://", _OSRM_ADAPTER)
+_ROUTE_CACHE: "OrderedDict[tuple, tuple[float, Dict[str, Any]]]" = OrderedDict()
+_ROUTE_CACHE_LOCK = threading.RLock()
+_ROUTE_SINGLEFLIGHT_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 
 def _parse_hhmm(value: Optional[str]) -> Optional[dt.datetime]:
@@ -133,6 +150,79 @@ def _safe_shortest_path(G, source, target, algorithm: str, weight: str = "travel
     return dijkstra_path(G, source, target, weight=weight)
 
 
+def _minimum_edge_weight(G, edge_data: Dict[str, Any], weight: str) -> float:
+    """Return the lightest parallel edge, matching MultiDiGraph semantics."""
+    candidates = edge_data.values() if G.is_multigraph() else (edge_data,)
+    values: List[float] = []
+    for attrs in candidates:
+        try:
+            value = attrs.get(weight)
+            if value is None:
+                value = float(attrs.get("length", 0.0)) / 8.33
+            value = float(value)
+            if math.isfinite(value) and value >= 0:
+                values.append(value)
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return min(values) if values else math.inf
+
+
+def _multi_target_dijkstra_paths(
+    G,
+    source,
+    targets: Sequence,
+    weight: str = "travel_time",
+) -> Tuple[Dict[Any, float], Dict[Any, List[Any]]]:
+    """Stop Dijkstra after the requested mosque nodes have been settled."""
+    remaining = set(targets)
+    if source not in G:
+        raise nx.NodeNotFound(f"Source {source!r} is not in G")
+    if not remaining:
+        return {}, {}
+
+    distances: Dict[Any, float] = {source: 0.0}
+    parents: Dict[Any, Any] = {}
+    settled: Dict[Any, float] = {}
+    found: Dict[Any, float] = {}
+    queue: List[Tuple[float, int, Any]] = [(0.0, 0, source)]
+    serial = 1
+
+    while queue and remaining:
+        distance, _, node = heapq.heappop(queue)
+        if node in settled:
+            continue
+        settled[node] = distance
+        if node in remaining:
+            found[node] = distance
+            remaining.remove(node)
+            if not remaining:
+                break
+
+        for neighbor, edge_data in G.adj[node].items():
+            edge_weight = _minimum_edge_weight(G, edge_data, weight)
+            if not math.isfinite(edge_weight):
+                continue
+            candidate_distance = distance + edge_weight
+            if candidate_distance < distances.get(neighbor, math.inf):
+                distances[neighbor] = candidate_distance
+                parents[neighbor] = node
+                heapq.heappush(queue, (candidate_distance, serial, neighbor))
+                serial += 1
+
+    paths: Dict[Any, List[Any]] = {}
+    for target in found:
+        path = [target]
+        while path[-1] != source:
+            parent = parents.get(path[-1])
+            if parent is None:
+                path = []
+                break
+            path.append(parent)
+        if path:
+            paths[target] = list(reversed(path))
+    return found, paths
+
+
 def _normalise_values(values: List[float]) -> List[float]:
     if not values:
         return []
@@ -194,6 +284,20 @@ def _local_route_coordinates(start: Coordinate, mosque: Coordinate, end: Coordin
     first = _interpolate_segment(start, mosque)
     second = _interpolate_segment(mosque, end)
     return first + second[1:]
+
+
+def _node_coordinate(G, node) -> Coordinate:
+    return float(G.nodes[node]["y"]), float(G.nodes[node]["x"])
+
+
+def _stitch_route_segments(*segments: Sequence[Coordinate]) -> List[Coordinate]:
+    coordinates: List[Coordinate] = []
+    for segment in segments:
+        for point in segment:
+            coordinate = (float(point[0]), float(point[1]))
+            if not coordinates or coordinate != coordinates[-1]:
+                coordinates.append(coordinate)
+    return coordinates
 
 
 def _douglas_peucker(points: List[Coordinate], epsilon_km: float) -> List[Coordinate]:
@@ -263,6 +367,16 @@ def _format_route_response(
     is_local_approximation = algorithm_label == "Local Approximation"
     routing_mode = "osrm_fallback" if used_osrm_fallback else "local_approximation" if is_local_approximation else "local_graph"
     graph_source = "osrm_public_api" if used_osrm_fallback else "none" if is_local_approximation else "osm_graphml_cache"
+    mosque_summary = {
+        key: best_m.get(key)
+        for key in (
+            "id", "dataset_id", "name", "address", "provinsi", "kabko",
+            "kecamatan", "kelurahan", "latitude", "longitude", "rating",
+            "review_count", "facilities", "fasilitas", "capacity_proxy",
+            "priority_score", "tier",
+        )
+        if best_m.get(key) is not None
+    }
 
     return {
         "algorithm": algorithm_label,
@@ -276,7 +390,7 @@ def _format_route_response(
         "execution_time_ms": elapsed_ms,
         "start": {"latitude": start_lat, "longitude": start_lon},
         "destination": {"latitude": end_lat, "longitude": end_lon},
-        "recommended_mosque": best_m,
+        "recommended_mosque": mosque_summary,
         "encoded_polyline": _encode_polyline(best["route_coordinates"]),
         "route_summary": {
             "distance_km": best["distance_km"],
@@ -436,7 +550,7 @@ def _osrm_route(start: Coordinate, mosque: Coordinate, end: Coordinate) -> Dict[
             f"{end[1]},{end[0]}"
         )
     url = f"{OSRM_ROUTE_URL}/{coords}"
-    response = requests.get(
+    response = _OSRM_SESSION.get(
         url,
         params={
             "overview": "full",
@@ -626,7 +740,7 @@ def _route_via_osrm_fallback(
     )
 
 
-def route_to_mosque(
+def _route_to_mosque_uncached(
     *,
     start_lat: float,
     start_lon: float,
@@ -741,14 +855,9 @@ def route_to_mosque(
 
     start_clock = time.perf_counter()
     try:
-        import osmnx as ox
-        try:
-            nearest_nodes = ox.distance.nearest_nodes(G, X=[start_lon, mosque_point[1]], Y=[start_lat, mosque_point[0]])
-            start_node = nearest_nodes[0]
-            mosque_node = nearest_nodes[1]
-        except Exception:
-            start_node = nearest_road_node(G, start_lat, start_lon)
-            mosque_node = nearest_road_node(G, mosque_point[0], mosque_point[1])
+        nearest_nodes = nearest_road_nodes_batch(G, [start, mosque_point])
+        start_node = nearest_nodes[0]
+        mosque_node = nearest_nodes[1]
         route_nodes = _safe_shortest_path(G, start_node, mosque_node, algorithm=algorithm, weight="travel_time")
     except (nx.NetworkXNoPath, nx.NodeNotFound, ValueError) as exc:
         return _route_via_osrm_fallback(
@@ -768,7 +877,14 @@ def route_to_mosque(
 
     dist_m = path_length_m(G, route_nodes)
     time_s = path_travel_time_s(G, route_nodes)
-    coords = route_nodes_to_latlon(G, route_nodes)
+    road_coords = route_nodes_to_latlon(G, route_nodes)
+    connector_m = 1000.0 * (
+        haversine_km(start[0], start[1], *_node_coordinate(G, start_node))
+        + haversine_km(mosque_point[0], mosque_point[1], *_node_coordinate(G, mosque_node))
+    )
+    dist_m += connector_m
+    time_s += connector_m / CONNECTOR_SPEED_MPS
+    coords = _stitch_route_segments([start], road_coords, [mosque_point])
     capacity_num = {"large": 1.0, "medium": 0.65, "small": 0.35}.get(mosque.get("capacity_proxy"), 0.5)
     priority = float(mosque.get("priority_score", 0.5))
     result = {
@@ -776,7 +892,7 @@ def route_to_mosque(
         "distance_km": round(dist_m / 1000, 3),
         "estimated_time_minutes": round(time_s / 60, 2),
         "arrival_to_mosque_minutes": round(time_s / 60, 2),
-        "route_nodes_count": len(route_nodes),
+        "route_nodes_count": len(coords),
         "capacity_score": capacity_num,
         "priority_score": priority,
         "prayer_penalty": 0.0,
@@ -798,6 +914,98 @@ def route_to_mosque(
         elapsed_ms=elapsed_ms,
         reason="Rute tercepat menuju masjid terpilih dihitung dengan Dijkstra/A* pada graph jalan OpenStreetMap lokal.",
     )
+
+
+def _route_cache_key(
+    *,
+    start_lat: float,
+    start_lon: float,
+    mosque: Dict[str, Any],
+    algorithm: str,
+    graphml_path: Path,
+    dataset_id: Optional[str],
+) -> tuple:
+    try:
+        graph_version = graphml_path.stat().st_mtime_ns
+    except OSError:
+        graph_version = 0
+    mosque_id = mosque.get("_key") or mosque.get("id") or mosque.get("name")
+    return (
+        str(dataset_id or "latest"),
+        str(graphml_path.resolve()),
+        graph_version,
+        round(float(start_lat), 3),
+        round(float(start_lon), 3),
+        str(mosque_id),
+        round(float(mosque["latitude"]), 5),
+        round(float(mosque["longitude"]), 5),
+        algorithm.lower(),
+    )
+
+
+def route_to_mosque(
+    *,
+    start_lat: float,
+    start_lon: float,
+    mosque: Dict[str, Any],
+    algorithm: str = "dijkstra",
+    auto_build_osm: bool = False,
+    buffer_km: float = 6.0,
+    graphml_path: Path = DEFAULT_GRAPHML,
+    dataset_id: Optional[str] = None,
+    fetch_mosques_fn: Optional[Callable] = None,
+    save_osm_cache_fn: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    key = _route_cache_key(
+        start_lat=start_lat,
+        start_lon=start_lon,
+        mosque=mosque,
+        algorithm=algorithm,
+        graphml_path=graphml_path,
+        dataset_id=dataset_id,
+    )
+    now = time.monotonic()
+    with _ROUTE_CACHE_LOCK:
+        cached = _ROUTE_CACHE.get(key)
+        if cached and now - cached[0] <= ROUTE_CACHE_TTL_SECONDS:
+            _ROUTE_CACHE.move_to_end(key)
+            result = copy.deepcopy(cached[1])
+            result["cache_hit"] = True
+            return result
+        if cached:
+            _ROUTE_CACHE.pop(key, None)
+
+    # Concurrent double-clicks/share-device requests reuse one computation.
+    singleflight_lock = _ROUTE_SINGLEFLIGHT_LOCKS[hash(key) % len(_ROUTE_SINGLEFLIGHT_LOCKS)]
+    with singleflight_lock:
+        now = time.monotonic()
+        with _ROUTE_CACHE_LOCK:
+            cached = _ROUTE_CACHE.get(key)
+            if cached and now - cached[0] <= ROUTE_CACHE_TTL_SECONDS:
+                _ROUTE_CACHE.move_to_end(key)
+                result = copy.deepcopy(cached[1])
+                result["cache_hit"] = True
+                return result
+
+        result = _route_to_mosque_uncached(
+            start_lat=start_lat,
+            start_lon=start_lon,
+            mosque=mosque,
+            algorithm=algorithm,
+            auto_build_osm=auto_build_osm,
+            buffer_km=buffer_km,
+            graphml_path=graphml_path,
+            dataset_id=dataset_id,
+            fetch_mosques_fn=fetch_mosques_fn,
+            save_osm_cache_fn=save_osm_cache_fn,
+        )
+        result["cache_hit"] = False
+        with _ROUTE_CACHE_LOCK:
+            _ROUTE_CACHE[key] = (time.monotonic(), copy.deepcopy(result))
+            _ROUTE_CACHE.move_to_end(key)
+            while len(_ROUTE_CACHE) > ROUTE_CACHE_MAX_ENTRIES:
+                _ROUTE_CACHE.popitem(last=False)
+        return result
 
 
 def route_via_osm_dijkstra(
@@ -831,11 +1039,11 @@ def route_via_osm_dijkstra(
             "isya": "isha"
         }
         api_name = name_map.get(resolved_name, resolved_name)
-        from app.infrastructure.services.prayer_time import get_prayer_times
+        from app.infrastructure.services.prayer_time import calculate_offline_prayer_times
         import datetime as dt_module
         try:
-            pt_data = get_prayer_times(float(start_lat), float(start_lon), dt_module.date.today())
-            raw_time = pt_data["timings"].get(api_name)
+            timings = calculate_offline_prayer_times(float(start_lat), float(start_lon), dt_module.date.today())
+            raw_time = timings.get(api_name)
             if raw_time:
                 match = re.search(r"\d{2}:\d{2}", raw_time)
                 prayer_time = match.group(0) if match else raw_time
@@ -1039,16 +1247,12 @@ def route_via_osm_dijkstra(
             profile=profile,
         )
 
-    import osmnx as ox
-    # Query nearest nodes in a single vectorized call
-    coords_lats = [start_lat, end_lat]
-    coords_lons = [start_lon, end_lon]
-    for m in candidates_in_graph:
-        coords_lats.append(float(m["latitude"]))
-        coords_lons.append(float(m["longitude"]))
-
     try:
-        nearest_nodes = ox.distance.nearest_nodes(G, X=coords_lons, Y=coords_lats)
+        query_points = [start, end] + [
+            (float(m["latitude"]), float(m["longitude"]))
+            for m in candidates_in_graph
+        ]
+        nearest_nodes = nearest_road_nodes_batch(G, query_points)
         start_node = nearest_nodes[0]
         end_node = nearest_nodes[1] if not is_one_way else start_node
         mosque_nodes = nearest_nodes[2:]
@@ -1060,17 +1264,48 @@ def route_via_osm_dijkstra(
 
     results: List[Dict[str, Any]] = []
     start_clock = time.perf_counter()
+    start_connector_m = 1000.0 * haversine_km(
+        start[0], start[1], *_node_coordinate(G, start_node)
+    )
+    end_connector_m = 0.0 if is_one_way else 1000.0 * haversine_km(
+        end[0], end[1], *_node_coordinate(G, end_node)
+    )
 
-    # Precompute paths using single-source Dijkstra
+    # Route only to the candidate targets. The old single-source call explored
+    # every reachable road and copied hundreds of thousands of path lists.
     try:
-        lengths_from_start, paths_from_start = nx.single_source_dijkstra(G, source=start_node, weight="travel_time")
-        if is_one_way:
-            lengths_to_end, paths_to_end = {}, {}
+        unique_mosque_nodes = list(dict.fromkeys(mosque_nodes))
+        if algorithm.lower() in {"astar", "a*"}:
+            paths_from_start = {}
+            paths_to_end = {}
+            for mosque_node in unique_mosque_nodes:
+                try:
+                    paths_from_start[mosque_node] = _safe_shortest_path(
+                        G, start_node, mosque_node, algorithm="astar", weight="travel_time"
+                    )
+                    if not is_one_way:
+                        paths_to_end[mosque_node] = _safe_shortest_path(
+                            G, mosque_node, end_node, algorithm="astar", weight="travel_time"
+                        )
+                except (nx.NetworkXNoPath, nx.NodeNotFound, ValueError):
+                    paths_from_start.pop(mosque_node, None)
+                    paths_to_end.pop(mosque_node, None)
         else:
-            if not hasattr(G, "_reversed_graph_cached"):
-                G._reversed_graph_cached = G.reverse(copy=True)
-            G_rev = G._reversed_graph_cached
-            lengths_to_end, paths_to_end = nx.single_source_dijkstra(G_rev, source=end_node, weight="travel_time")
+            _, paths_from_start = _multi_target_dijkstra_paths(
+                G, start_node, unique_mosque_nodes, weight="travel_time"
+            )
+            if is_one_way:
+                paths_to_end = {}
+            else:
+                # A reverse view shares edge data and avoids a multi-GB graph copy.
+                reversed_graph = G.reverse(copy=False)
+                _, reverse_paths = _multi_target_dijkstra_paths(
+                    reversed_graph, end_node, unique_mosque_nodes, weight="travel_time"
+                )
+                paths_to_end = {
+                    mosque_node: reverse_path[::-1]
+                    for mosque_node, reverse_path in reverse_paths.items()
+                }
     except Exception as exc:
         return _route_via_osrm_fallback(
             start=start,
@@ -1099,18 +1334,30 @@ def route_via_osm_dijkstra(
         if is_one_way:
             path_2 = [mosque_node]
         else:
-            path_2 = paths_to_end[mosque_node][::-1]
+            path_2 = paths_to_end[mosque_node]
 
         dist_m = path_length_m(G, path_1)
         time_s = path_travel_time_s(G, path_1)
+        mosque_point = (float(mosque["latitude"]), float(mosque["longitude"]))
+        mosque_connector_m = 1000.0 * haversine_km(
+            mosque_point[0], mosque_point[1], *_node_coordinate(G, mosque_node)
+        )
         if not is_one_way:
             dist_m += path_length_m(G, path_2)
             time_s += path_travel_time_s(G, path_2)
             route_nodes = path_1 + path_2[1:]
+            connector_m = start_connector_m + end_connector_m + (2.0 * mosque_connector_m)
         else:
             route_nodes = path_1
+            connector_m = start_connector_m + mosque_connector_m
 
-        to_mosque_minutes = path_travel_time_s(G, path_1) / 60.0
+        dist_m += connector_m
+        time_s += connector_m / CONNECTOR_SPEED_MPS
+
+        to_mosque_minutes = (
+            path_travel_time_s(G, path_1)
+            + (start_connector_m + mosque_connector_m) / CONNECTOR_SPEED_MPS
+        ) / 60.0
         capacity_num = {"large": 1.0, "medium": 0.65, "small": 0.35}.get(mosque.get("capacity_proxy"), 0.5)
         priority = float(mosque.get("priority_score", 0.5))
         prayer_penalty, arrival_status, minutes_before_prayer = _prayer_arrival_details(to_mosque_minutes, current_time, prayer_time)
@@ -1128,6 +1375,8 @@ def route_via_osm_dijkstra(
             "minutes_before_prayer": round(minutes_before_prayer, 1),
             "route_coordinates": [],
             "route_nodes": route_nodes,
+            "route_path_1": path_1,
+            "route_path_2": path_2,
         })
 
     elapsed_ms = round((time.perf_counter() - start_clock) * 1000, 2)
@@ -1183,10 +1432,28 @@ def route_via_osm_dijkstra(
 
     results.sort(key=lambda x: x["multi_objective_score"])
     best_res = results[0]
-    best_res["route_coordinates"] = route_nodes_to_latlon(G, best_res["route_nodes"])
+    best_mosque_point = (
+        float(best_res["mosque"]["latitude"]),
+        float(best_res["mosque"]["longitude"]),
+    )
+    first_road_segment = route_nodes_to_latlon(G, best_res["route_path_1"])
+    if is_one_way:
+        best_res["route_coordinates"] = _stitch_route_segments(
+            [start], first_road_segment, [best_mosque_point]
+        )
+    else:
+        second_road_segment = route_nodes_to_latlon(G, best_res["route_path_2"])
+        best_res["route_coordinates"] = _stitch_route_segments(
+            [start], first_road_segment, [best_mosque_point], second_road_segment, [end]
+        )
+    best_res["route_nodes_count"] = len(best_res["route_coordinates"])
 
     return _format_route_response(
-        algorithm_label="Dijkstra (Multi-Destination)",
+        algorithm_label=(
+            "A* (Multi-Destination)"
+            if algorithm.lower() in {"astar", "a*"}
+            else "Dijkstra (Multi-Destination)"
+        ),
         road_network="OpenStreetMap via OSMnx/NetworkX",
         routing_weight="travel_time_seconds",
         dataset_id=dataset_id,

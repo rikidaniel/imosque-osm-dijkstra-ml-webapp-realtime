@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Literal, Optional
+from datetime import datetime
 
 from pydantic import BaseModel, Field
 
@@ -33,8 +34,9 @@ class RouteToMosqueRequest(BaseModel):
     mosque_id: str
     dataset_id: Optional[str] = Field(None, description="Dataset aktif, contoh: banten, dki_jakarta, jawa_barat")
     algorithm: Literal["dijkstra", "astar"] = "astar"
-    auto_build_osm: bool = Field(False, description="Jika true, backend boleh mencoba build graph OSM")
+    auto_build_osm: bool = Field(False, description="Build inline hanya aktif jika server mengizinkan; default memakai cache/OSRM agar respons cepat")
     buffer_km: float = Field(6.0, ge=1.0, le=200.0)
+    compact_response: bool = Field(True, description="Kirim encoded polyline tanpa duplikasi GeoJSON untuk jaringan lambat")
 
 
 class BuildOsmRequest(BaseModel):
@@ -44,6 +46,40 @@ class BuildOsmRequest(BaseModel):
     west: float
     network_type: Literal["drive", "walk", "bike", "all"] = "drive"
     dataset_id: Optional[str] = Field(None, description="Dataset ID aktif")
+
+
+class BuildAllOsmRequest(BaseModel):
+    network_type: Literal["drive", "walk", "bike", "all"] = "drive"
+    force: bool = Field(False, description="Bangun ulang graph yang sudah tersedia")
+
+
+class SearchSettingsPayload(BaseModel):
+    algorithm: Literal["dijkstra", "astar"] = "dijkstra"
+    profile: Literal["fastest", "prayer_priority", "low_cost", "balanced"] = "balanced"
+    currentTime: str = Field("17:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    prayer: Literal["subuh", "dzuhur", "ashar", "maghrib", "isya"] = "maghrib"
+    maxCandidates: str = Field("3", pattern=r"^(?:[1-9]|10)$")
+    bufferKm: str = Field("15", pattern=r"^(?:[2-9]|[1-9]\d|1\d\d|200)(?:\.\d+)?$")
+    autoBuild: bool = False
+
+
+class PrayerScheduleItem(BaseModel):
+    name: Literal["Subuh", "Dzuhur", "Ashar", "Maghrib", "Isya"]
+    time: str = Field(..., pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    isAlarmActive: bool = False
+
+
+class PrayerSettingsPayload(BaseModel):
+    schedule: list[PrayerScheduleItem] = Field(default_factory=list, max_length=5)
+    hijriDate: Optional[str] = Field(None, max_length=80)
+    masehiDate: Optional[str] = Field(None, max_length=80)
+
+
+class UserSettingsRequest(BaseModel):
+    user_id: str = Field(..., min_length=3, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    search_settings: Optional[SearchSettingsPayload] = None
+    prayer_settings: Optional[PrayerSettingsPayload] = None
+    updated_at: Optional[datetime] = None
 
 
 class BuildOsmRouteRequest(BaseModel):
@@ -97,8 +133,9 @@ class RecommendRouteRequest(BaseModel):
     profile: Literal["fastest", "prayer_priority", "low_cost", "balanced"] = "balanced"
     search_radius_km: float = Field(10.0, ge=1.0, le=200.0)
     maximum_results: int = Field(3, ge=1, le=10)
-    auto_build_osm: bool = Field(True, description="Otomatis build/download map dari Overpass jika rute di luar batas")
+    auto_build_osm: bool = Field(False, description="Gunakan endpoint admin untuk build; request interaktif memakai cache/OSRM")
     dataset_id: Optional[str] = None
+    compact_response: bool = Field(True, description="Kirim encoded polyline tanpa duplikasi GeoJSON")
 
 
 class BenchmarkRequest(BaseModel):
@@ -109,4 +146,3 @@ class BenchmarkRequest(BaseModel):
     profile: Literal["fastest", "prayer_priority", "low_cost", "balanced"] = "balanced"
     search_radius_km: float = Field(10.0, ge=1.0, le=200.0)
     dataset_id: Optional[str] = None
-

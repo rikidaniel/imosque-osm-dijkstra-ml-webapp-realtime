@@ -15,7 +15,7 @@ def init_db():
     db = _client.db(DB_NAME, username='root', password=ARANGO_ROOT_PASSWORD)
     
     # Document Collections
-    doc_cols = ['Province', 'City', 'District', 'Village', 'Mosque', 'RoadNode', 'CheckInCheckOut', 'datasets', 'app_settings', 'osm_graph_cache']
+    doc_cols = ['Province', 'City', 'District', 'Village', 'Mosque', 'RoadNode', 'CheckInCheckOut', 'datasets', 'app_settings', 'osm_graph_cache', 'user_settings']
     for name in doc_cols:
         if not db.has_collection(name):
             db.create_collection(name)
@@ -23,9 +23,14 @@ def init_db():
         col = db.collection(name)
         if name == 'Mosque':
             col.add_persistent_index(fields=['dataset_id'])
+            col.add_persistent_index(fields=['dataset_id', 'id'])
+            col.add_persistent_index(fields=['id'])
             _ensure_geojson_index(db, name, ['coordinate'])
         elif name == 'RoadNode':
             _ensure_geojson_index(db, name, ['coordinate'])
+        elif name == 'user_settings':
+            # Index untuk query cepat berdasarkan user_id
+            col.add_persistent_index(fields=['user_id'], unique=True)
                 
     # Edge Collections
     edge_cols = ['BELONGS_TO_PROVINCE', 'BELONGS_TO_CITY', 'BELONGS_TO_DISTRICT', 'LOCATED_IN_VILLAGE', 'ROAD_CONNECTION']

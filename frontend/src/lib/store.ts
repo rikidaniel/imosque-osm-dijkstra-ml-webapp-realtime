@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { debouncedSaveSettings, loadSettingsFromDatabase } from "./settings-sync";
 
 interface SearchSettings {
   algorithm: string;
@@ -51,11 +52,14 @@ interface AppState {
   setPrayerSchedule: (schedule: any[]) => void;
   setHijriDate: (date: string) => void;
   setMasehiDate: (date: string) => void;
+  prayerCacheKey: string | null;
+  setPrayerCacheKey: (key: string) => void;
+  settingsSyncStatus: "loading" | "loaded" | "offline";
 }
 
 export const useAppStore = create<AppState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       datasets: [],
       activeDatasetId: "all",
       setDatasets: (datasets) => set({ datasets }),
@@ -81,19 +85,35 @@ export const useAppStore = create<AppState>()(
         currentTime: "17:00",
         prayer: "maghrib",
         maxCandidates: "3",
-        bufferKm: "50",
-        autoBuild: true,
+        bufferKm: "15",
+        autoBuild: false,
       },
-      setSearchSettings: (settings) =>
+      setSearchSettings: (settings) => {
         set((state) => ({
           searchSettings: { ...state.searchSettings, ...settings },
-        })),
+        }));
+        // Auto-save to database with debounce
+        const currentState = get();
+        debouncedSaveSettings({
+          searchSettings: { ...currentState.searchSettings, ...settings },
+          prayerSettings: {
+            schedule: currentState.prayerSchedule || [],
+            hijriDate: currentState.hijriDate,
+            masehiDate: currentState.masehiDate,
+          }
+        });
+      },
 
       routeCache: {},
       setRouteCache: (key, data) =>
-        set((state) => ({
-          routeCache: { ...state.routeCache, [key]: data },
-        })),
+        set((state) => {
+          const entries = Object.entries(state.routeCache)
+            .filter(([existingKey]) => existingKey !== key)
+            .slice(-19);
+          return {
+            routeCache: Object.fromEntries([...entries, [key, { ...data, _cached_at: Date.now() }]]),
+          };
+        }),
       clearRouteCache: () => set({ routeCache: {} }),
 
       prayerSchedule: [
@@ -105,13 +125,43 @@ export const useAppStore = create<AppState>()(
       ],
       hijriDate: "12 Muharram 1448 H",
       masehiDate: "12 Juli 2026",
-      setPrayerSchedule: (schedule) => set({ prayerSchedule: schedule }),
-      setHijriDate: (date) => set({ hijriDate: date }),
-      setMasehiDate: (date) => set({ masehiDate: date }),
+      prayerCacheKey: null,
+      settingsSyncStatus: "loading",
+      setPrayerSchedule: (schedule) => {
+        set({ prayerSchedule: schedule });
+        // Auto-save to database with debounce
+        const currentState = get();
+        debouncedSaveSettings({
+          searchSettings: currentState.searchSettings,
+          prayerSettings: {
+            schedule: schedule,
+            hijriDate: currentState.hijriDate,
+            masehiDate: currentState.masehiDate,
+          }
+        });
+      },
+      setHijriDate: (date) => {
+        set({ hijriDate: date });
+        const state = get();
+        debouncedSaveSettings({
+          searchSettings: state.searchSettings,
+          prayerSettings: { schedule: state.prayerSchedule || [], hijriDate: date, masehiDate: state.masehiDate },
+        });
+      },
+      setMasehiDate: (date) => {
+        set({ masehiDate: date });
+        const state = get();
+        debouncedSaveSettings({
+          searchSettings: state.searchSettings,
+          prayerSettings: { schedule: state.prayerSchedule || [], hijriDate: state.hijriDate, masehiDate: date },
+        });
+      },
+      setPrayerCacheKey: (key) => set({ prayerCacheKey: key }),
     }),
     {
       name: "imosque-app-store",
-      version: 2, // Naikkan versi jika ada perubahan default state yang perlu di-reset
+      version: 3,
+      migrate: (persistedState) => persistedState as AppState,
       partialize: (state) => ({
         startPoint: state.startPoint,
         endPoint: state.endPoint,
@@ -121,6 +171,7 @@ export const useAppStore = create<AppState>()(
         prayerSchedule: state.prayerSchedule,
         hijriDate: state.hijriDate,
         masehiDate: state.masehiDate,
+        prayerCacheKey: state.prayerCacheKey,
       }),
       merge: (persistedState: any, currentState) => {
         // Pastikan searchSettings default terbaru dipakai jika version lama
@@ -132,10 +183,37 @@ export const useAppStore = create<AppState>()(
             ...(persistedState?.searchSettings || {}),
           },
         };
-        // Force update bufferKm ke 50 jika masih lama (10)
-        if (merged.searchSettings.bufferKm === "10") {
-          merged.searchSettings.bufferKm = "50";
+        if (merged.searchSettings.bufferKm === "10" || merged.searchSettings.bufferKm === "50") {
+          merged.searchSettings.bufferKm = "15";
         }
+        // Existing installs used inline Overpass builds. Keep interactive routes fast.
+        merged.searchSettings.autoBuild = false;
+        
+        // Load settings from database on initialization (async, non-blocking)
+        if (typeof window !== "undefined") {
+          loadSettingsFromDatabase().then((dbSettings) => {
+            if (dbSettings) {
+              // Merge database settings with current state
+              useAppStore.setState((state) => ({
+                searchSettings: {
+                  ...state.searchSettings,
+                  ...(dbSettings.search_settings || {}),
+                },
+                prayerSchedule: dbSettings.prayer_settings?.schedule || state.prayerSchedule,
+                hijriDate: dbSettings.prayer_settings?.hijriDate || state.hijriDate,
+                masehiDate: dbSettings.prayer_settings?.masehiDate || state.masehiDate,
+                settingsSyncStatus: "loaded",
+              }));
+              console.log("Settings loaded from database and merged with local state");
+            } else {
+              useAppStore.setState({ settingsSyncStatus: "loaded" });
+            }
+          }).catch((err) => {
+            console.warn("Could not load settings from database:", err);
+            useAppStore.setState({ settingsSyncStatus: "offline" });
+          });
+        }
+        
         return merged;
       },
     }

@@ -16,6 +16,7 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const isDevelopment = process.env.NODE_ENV !== "production";
   return (
     <html lang="id" suppressHydrationWarning>
       <head>
@@ -26,33 +27,13 @@ export default function RootLayout({
             __html: `
               // === PWA Service Worker Registration ===
               if ('serviceWorker' in navigator) {
-                if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-                  // Di lingkungan development, unregister SW aktif agar tidak mengacaukan caching Next.js dev bundles/hot-reloading
-                  navigator.serviceWorker.getRegistrations().then(function(registrations) {
-                    for (let registration of registrations) {
-                      registration.unregister().then(function(success) {
-                        if (success) {
-                          console.log('[SW] Berhasil melakukan unregister SW aktif di development.');
-                          // Gunakan sessionStorage dan setTimeout untuk mencegah gangguan hidrasi React & reload loop
-                          if (!sessionStorage.getItem('sw_unregistered_reload')) {
-                            sessionStorage.setItem('sw_unregistered_reload', 'true');
-                            setTimeout(function() {
-                              window.location.reload();
-                            }, 500);
-                          }
-                        }
-                      });
-                    }
+                window.addEventListener('load', function() {
+                  navigator.serviceWorker.register('/sw.js${isDevelopment ? "?dev=1" : ""}', { updateViaCache: 'all' }).then(function(reg) {
+                    console.log('[SW] Service Worker registered, scope:', reg.scope);
+                  }).catch(function(err) {
+                    console.warn('[SW] Service Worker registration failed:', err);
                   });
-                } else {
-                  window.addEventListener('load', function() {
-                    navigator.serviceWorker.register('/sw.js').then(function(reg) {
-                      console.log('[SW] Service Worker registered, scope:', reg.scope);
-                    }).catch(function(err) {
-                      console.warn('[SW] Service Worker registration failed:', err);
-                    });
-                  });
-                }
+                });
               }
 
               // Hapus atribut bis_skin_checked jika sudah ada di DOM
@@ -78,15 +59,15 @@ export default function RootLayout({
       <body className={inter.className} suppressHydrationWarning>
         <ThemeProvider
           attribute="class"
-          defaultTheme="system"
-          enableSystem
+          defaultTheme="light"
+          enableSystem={false}
           disableTransitionOnChange
+          forcedTheme="light"
         >
           {children}
-          <Toaster position="top-center" richColors closeButton theme="system" />
+          <Toaster position="top-center" richColors closeButton theme="light" />
         </ThemeProvider>
       </body>
     </html>
   );
 }
-

@@ -1,4 +1,6 @@
 import os
+from typing import Any, Dict, Iterable, List
+
 from arango import ArangoClient
 
 ARANGO_HOST = os.getenv("ARANGO_HOST", "http://localhost:8529")
@@ -38,32 +40,60 @@ def init_db():
         if not db.has_collection(name):
             db.create_collection(name, edge=True)
 
+def _normalise_index_fields(fields: Iterable[str]) -> List[str]:
+    return [str(field) for field in fields]
+
+
+def _is_expected_geojson_index(index: Dict[str, Any], fields: Iterable[str]) -> bool:
+    """Return True only for a GeoJSON index on the requested fields.
+
+    python-arango has exposed the GeoJSON flag as both ``geoJson`` and
+    ``geo_json`` across releases, so accept either spelling while keeping the
+    field comparison exact. A geo index for another attribute must never make
+    startup skip the ``coordinate`` index.
+    """
+    expected_fields = _normalise_index_fields(fields)
+    index_fields = _normalise_index_fields(index.get('fields') or [])
+    is_geojson = bool(index.get('geoJson', index.get('geo_json', False)))
+    return index.get('type') == 'geo' and index_fields == expected_fields and is_geojson
+
+
 def _ensure_geojson_index(db, collection_name, fields):
-    from arango.request import Request
     col = db.collection(collection_name)
-    has_correct_index = False
-    
-    for idx in col.indexes():
-        if idx['type'] == 'geo':
-            if idx.get('geo_json', False) or idx.get('geoJson', False):
-                has_correct_index = True
-            else:
-                try:
-                    col.delete_index(idx['id'])
-                except Exception:
-                    pass
-                    
-    if not has_correct_index:
-        req = Request(
-            method='post',
-            endpoint='/_api/index',
-            params={'collection': collection_name},
-            data={'type': 'geo', 'fields': fields, 'geoJson': True}
+    expected_fields = _normalise_index_fields(fields)
+    indexes = col.indexes()
+
+    if any(_is_expected_geojson_index(index, expected_fields) for index in indexes):
+        return
+
+    # Remove only an incompatible index on these exact fields. Other geo
+    # indexes may be intentional and are left untouched.
+    for index in indexes:
+        if (
+            index.get('type') == 'geo'
+            and _normalise_index_fields(index.get('fields') or []) == expected_fields
+        ):
+            try:
+                col.delete_index(index['id'])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Gagal mengganti geo index {collection_name}.{'.'.join(expected_fields)}: {exc}"
+                ) from exc
+
+    try:
+        # Public python-arango API. ``ordered=True`` maps to ``geoJson: true``
+        # and therefore stores coordinates in [longitude, latitude] order.
+        col.add_geo_index(fields=expected_fields, ordered=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Gagal membuat GeoJSON index {collection_name}.{'.'.join(expected_fields)}: {exc}"
+        ) from exc
+
+    created_indexes = col.indexes()
+    if not any(_is_expected_geojson_index(index, expected_fields) for index in created_indexes):
+        raise RuntimeError(
+            f"GeoJSON index {collection_name}.{'.'.join(expected_fields)} tidak terverifikasi setelah dibuat."
         )
-        try:
-            db.conn.send_request(req)
-        except Exception as e:
-            print(f"Error creating geoJson index on {collection_name}: {e}")
 
 def get_db():
     return _client.db(DB_NAME, username='root', password=ARANGO_ROOT_PASSWORD)

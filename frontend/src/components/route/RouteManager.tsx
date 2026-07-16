@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useAppStore } from "@/lib/store";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Checkbox } from "@/components/ui/checkbox";
 import { toast } from "sonner";
 import { MapPin, Navigation, Clock, Locate } from "lucide-react";
+import { isAbortError, isRouteCacheFresh, RECOMMENDATION_CACHE_TTL_MS } from "@/lib/api";
 
 const API_BASE = typeof window !== "undefined"
   ? `http://${window.location.hostname}:8000`
@@ -26,6 +27,13 @@ export default function RouteManager() {
   const [maxCandidates, setMaxCandidates] = useState("3");
   const [bufferKm, setBufferKm] = useState("10");
   const [autoBuild, setAutoBuild] = useState(true);
+  const locationRequestRef = useRef(0);
+  const recommendationAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    locationRequestRef.current += 1;
+    recommendationAbortRef.current?.abort();
+  }, []);
 
   // Sync searchQuery with endPoint (e.g. if set from map pins)
   useEffect(() => {
@@ -56,17 +64,20 @@ export default function RouteManager() {
       return;
     }
     
+    const requestId = ++locationRequestRef.current;
     const toastId = toast.loading("Mendeteksi lokasi saat ini...");
     navigator.geolocation.getCurrentPosition(
       (position) => {
+        if (requestId !== locationRequestRef.current) return;
         toast.dismiss(toastId);
         setStartPoint({
           lat: position.coords.latitude,
           lng: position.coords.longitude
-        });
+        }, position.timestamp || Date.now(), "gps");
         toast.success("Lokasi terdeteksi.");
       },
-      (error) => {
+      () => {
+        if (requestId !== locationRequestRef.current) return;
         toast.dismiss(toastId);
         toast.error("Gagal mendeteksi lokasi. Pastikan izin GPS aktif.");
       },
@@ -84,14 +95,21 @@ export default function RouteManager() {
       return;
     }
 
+    const previousRecommendation = recommendationAbortRef.current;
+    previousRecommendation?.abort();
+    recommendationAbortRef.current = null;
+    if (previousRecommendation) setLoading(false);
     const cacheKey = `${activeDatasetId}_${startPoint.lat.toFixed(5)}_${startPoint.lng.toFixed(5)}_${endPoint ? `${endPoint.lat.toFixed(5)}_${endPoint.lng.toFixed(5)}` : 'none'}_${algorithm}_${currentTime}_${prayer}_${profile}_${maxCandidates}_${bufferKm}`;
 
-    if (routeCache && routeCache[cacheKey]) {
+    if (isRouteCacheFresh(routeCache?.[cacheKey], RECOMMENDATION_CACHE_TTL_MS)) {
       setRouteData(routeCache[cacheKey]);
       toast.success("Rute berhasil ditemukan (dari Cache Lokal).");
       return;
     }
 
+    const controller = new AbortController();
+    recommendationAbortRef.current = controller;
+    let timedOut = false;
     setLoading(true);
     try {
       const payload = {
@@ -117,11 +135,16 @@ export default function RouteManager() {
         compact_response: true,
       };
 
+      const timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, 12000);
       const res = await fetch(`${API_BASE}/api/v1/routes/recommend`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      }).finally(() => window.clearTimeout(timeoutId));
 
       if (!res.ok) {
         const err = await res.json();
@@ -129,18 +152,23 @@ export default function RouteManager() {
       }
 
       const data = await res.json();
+      if (recommendationAbortRef.current !== controller) return;
       setRouteData(data);
       if (setRouteCache) {
         setRouteCache(cacheKey, data);
       }
       toast.success("Rute berhasil ditemukan.");
     } catch (err: any) {
+      if (isAbortError(err) && !timedOut) return;
+      if (isAbortError(err) && timedOut) {
+        err = new Error("Pencarian rute melewati batas waktu. Silakan coba lagi.");
+      }
       // Offline fallback: cari cache yang mencakup koordinat start dan end yang sama
       const startKey = `${startPoint.lat.toFixed(5)}_${startPoint.lng.toFixed(5)}`;
       const endKey = endPoint ? `${endPoint.lat.toFixed(5)}_${endPoint.lng.toFixed(5)}` : startKey;
       
       const cachedMatch = Object.entries(routeCache || {}).find(([key]) => {
-        return key.includes(startKey) && key.includes(endKey);
+        return !key.startsWith("selected_") && key.includes(startKey) && key.includes(endKey);
       });
 
       if (cachedMatch) {
@@ -150,14 +178,11 @@ export default function RouteManager() {
         toast.error(err.message || "Gagal mencari rute. Silakan periksa koneksi internet Anda.");
       }
     } finally {
-      setLoading(false);
+      if (recommendationAbortRef.current === controller) {
+        recommendationAbortRef.current = null;
+        setLoading(false);
+      }
     }
-  };
-
-  const handleClearPoints = () => {
-    setStartPoint(null);
-    setEndPoint(null);
-    setRouteData(null);
   };
 
   return (
@@ -194,7 +219,11 @@ export default function RouteManager() {
                 </Button>
                 {startPoint && (
                   <button 
-                    onClick={() => setStartPoint(null)} 
+                    onClick={() => {
+                      locationRequestRef.current += 1;
+                      recommendationAbortRef.current?.abort();
+                      setStartPoint(null);
+                    }}
                     className="text-[10px] font-bold text-slate-400 hover:text-slate-600 px-1"
                   >
                     Atur Ulang

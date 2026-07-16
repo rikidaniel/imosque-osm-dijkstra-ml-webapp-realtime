@@ -21,10 +21,10 @@ class RouteRequest(BaseModel):
 
 
 class NearestMosquesRequest(BaseModel):
-    latitude: float
-    longitude: float
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
     dataset_id: Optional[str] = Field(None, description="Dataset aktif, contoh: banten, dki_jakarta, jawa_barat")
-    limit: int = Field(6, ge=1, le=5000)
+    limit: int = Field(6, ge=1, le=50, description="Maksimum hasil interaktif agar query dan payload tetap cepat")
     radius_km: float = Field(10.0, ge=0.5, le=200.0)
 
 
@@ -98,8 +98,8 @@ class BulkDeleteRequest(BaseModel):
 
 class MosqueCreateRequest(BaseModel):
     name: str = Field(..., description="Nama masjid")
-    latitude: float
-    longitude: float
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
     kecamatan: Optional[str] = None
     kabko: Optional[str] = None
     provinsi: Optional[str] = None
@@ -109,8 +109,8 @@ class MosqueCreateRequest(BaseModel):
 
 class MosqueUpdateRequest(BaseModel):
     name: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(None, ge=-180.0, le=180.0)
     kecamatan: Optional[str] = None
     kabko: Optional[str] = None
     provinsi: Optional[str] = None

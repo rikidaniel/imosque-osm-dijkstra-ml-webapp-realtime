@@ -3,15 +3,20 @@ import datetime as dt
 from backend.app.infrastructure.services.osm_graph import (
     _validate_bbox_size,
     haversine_km,
+    nearest_road_edge_candidates_batch,
+    nearest_road_node,
     path_length_m,
     path_travel_time_s,
     route_nodes_to_latlon,
 )
 from backend.app.infrastructure.services.routing_osm import (
+    _best_edge_snapped_route,
+    _best_snapped_route,
     _multi_target_dijkstra_paths,
     _normalise_values,
     _prayer_arrival_details,
     _distance_point_to_segment_km,
+    select_candidate_mosques,
 )
 from backend.app.infrastructure.services.prayer_time import calculate_offline_prayer_times
 
@@ -39,6 +44,33 @@ def test_distance_point_to_segment_km():
     b = (-6.2, 106.9)
     dist = _distance_point_to_segment_km(p, a, b)
     assert dist < 0.01 # extremely close to 0
+
+
+def test_vectorized_candidate_selection_preserves_stable_ranking_and_fallback():
+    mosques = [
+        {"id": "first", "latitude": -6.20, "longitude": 106.81, "priority_score": 0.5},
+        {"id": "second", "latitude": -6.20, "longitude": 106.81, "priority_score": 0.5},
+        {"id": "far", "latitude": -6.30, "longitude": 106.90, "priority_score": 1.0},
+    ]
+
+    ranked = select_candidate_mosques(
+        mosques,
+        (-6.20, 106.80),
+        (-6.20, 106.82),
+        limit=2,
+        corridor_km=2.0,
+    )
+    fallback = select_candidate_mosques(
+        mosques,
+        (-6.31, 106.90),
+        (-6.31, 106.91),
+        limit=1,
+        corridor_km=0.1,
+        fallback_radius_km=20.0,
+    )
+
+    assert [mosque["id"] for mosque in ranked] == ["first", "second"]
+    assert fallback[0]["id"] == "far"
 
 def test_prayer_arrival_details():
     # Arrival 15 minutes before prayer (optimal: penalty 0.0)
@@ -103,18 +135,17 @@ def test_edge_helpers_support_digraph_and_multidigraph():
         assert route_nodes_to_latlon(graph, [1, 2]) == [(-6.2, 106.8), (-6.21, 106.81)]
 
 
-def test_nearest_mosques_uses_adaptive_radius():
+def test_nearest_mosques_uses_one_max_radius_query():
     from unittest.mock import Mock
     from backend.app.use_cases.dataset_usecases import DatasetUseCases
 
     mosque_repo = Mock()
-    mosque_repo.get_nearest_mosques.side_effect = [[], [{"id": "a"}, {"id": "b"}, {"id": "c"}]]
+    mosque_repo.get_nearest_mosques.return_value = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
     use_case = DatasetUseCases(mosque_repo, Mock())
     result = use_case.get_nearest_mosques("all", -6.2, 106.8, 50, 3)
 
-    assert result["search_radius_used_km"] == 15.0
-    assert mosque_repo.get_nearest_mosques.call_args_list[0].args[3] == 5.0
-    assert mosque_repo.get_nearest_mosques.call_args_list[1].args[3] == 15.0
+    assert result["search_radius_used_km"] == 50.0
+    mosque_repo.get_nearest_mosques.assert_called_once_with("all", -6.2, 106.8, 50.0, 3)
 
 
 def test_inline_osm_build_is_opt_in(monkeypatch):
@@ -158,3 +189,145 @@ def test_nearest_road_nodes_reuses_spatial_index():
     first_index = graph._imosque_nearest_index
     assert nearest_road_nodes_batch(graph, [(-6.20, 106.80)]) == ["west"]
     assert graph._imosque_nearest_index is first_index
+
+
+def test_nearest_road_node_candidates_returns_ordered_alternatives():
+    import networkx as nx
+    from backend.app.infrastructure.services.osm_graph import nearest_road_node_candidates_batch
+
+    graph = nx.MultiDiGraph()
+    graph.graph["crs"] = "EPSG:4326"
+    graph.add_node("nearest", y=-6.2000, x=106.8000)
+    graph.add_node("second", y=-6.2000, x=106.8002)
+    graph.add_node("far", y=-6.2000, x=106.8100)
+
+    candidates = nearest_road_node_candidates_batch(graph, [(-6.2000, 106.80001)], k=2)
+
+    assert candidates == [["nearest", "second"]]
+
+
+def test_edge_projection_finds_road_geometry_between_distant_osm_nodes():
+    import networkx as nx
+    from shapely.geometry import LineString
+
+    graph = nx.DiGraph()
+    graph.graph["crs"] = "EPSG:4326"
+    graph.add_node("west", y=-6.20, x=106.80)
+    graph.add_node("east", y=-6.20, x=106.82)
+    graph.add_node("decoy", y=-6.2002, x=106.8102)
+    graph.add_node("decoy-end", y=-6.21, x=106.811)
+    main_geometry = LineString([(106.80, -6.20), (106.82, -6.20)])
+    graph.add_edge("west", "east", length=2200.0, travel_time=220.0, geometry=main_geometry)
+    graph.add_edge("east", "west", length=2200.0, travel_time=220.0, geometry=main_geometry)
+    graph.add_edge("decoy", "decoy-end", length=1100.0, travel_time=110.0)
+
+    point = (-6.20005, 106.81)
+
+    assert nearest_road_node(graph, *point) == "decoy"
+    snap = nearest_road_edge_candidates_batch(graph, [point], k=1)[0][0]
+    assert {snap.u, snap.v} == {"west", "east"}
+    assert snap.connector_m < 10.0
+
+
+def test_edge_snapped_route_charges_only_the_traversed_edge_fraction():
+    import networkx as nx
+    from shapely.geometry import LineString
+
+    graph = nx.DiGraph()
+    graph.graph["crs"] = "EPSG:4326"
+    graph.add_node("west", y=-6.20, x=106.80)
+    graph.add_node("east", y=-6.20, x=106.82)
+    geometry = LineString([(106.80, -6.20), (106.82, -6.20)])
+    graph.add_edge("west", "east", length=2200.0, travel_time=220.0, geometry=geometry)
+    graph.add_edge("east", "west", length=2200.0, travel_time=220.0, geometry=geometry)
+
+    result = _best_edge_snapped_route(
+        graph,
+        (-6.20001, 106.805),
+        (-6.20001, 106.815),
+        algorithm="dijkstra",
+        candidate_count=1,
+    )
+
+    assert result["road_length_m"] == pytest.approx(1100.0, abs=1.0)
+    assert result["connector_m"] < 3.0
+    assert result["road_coordinates"][0][1] == pytest.approx(106.805, abs=1e-6)
+    assert result["road_coordinates"][-1][1] == pytest.approx(106.815, abs=1e-6)
+
+
+def test_edge_snapped_route_does_not_travel_backwards_on_one_way_edge():
+    import networkx as nx
+    from shapely.geometry import LineString
+
+    graph = nx.DiGraph()
+    graph.graph["crs"] = "EPSG:4326"
+    graph.add_node("west", y=-6.20, x=106.80)
+    graph.add_node("east", y=-6.20, x=106.82)
+    graph.add_edge(
+        "west",
+        "east",
+        length=2200.0,
+        travel_time=220.0,
+        geometry=LineString([(106.80, -6.20), (106.82, -6.20)]),
+    )
+
+    with pytest.raises(nx.NetworkXNoPath):
+        _best_edge_snapped_route(
+            graph,
+            (-6.20, 106.816),
+            (-6.20, 106.804),
+            algorithm="dijkstra",
+            candidate_count=1,
+        )
+
+
+def test_best_snapped_route_avoids_wrong_side_of_divided_road(monkeypatch):
+    import networkx as nx
+    from backend.app.infrastructure.services import routing_osm
+
+    graph = nx.DiGraph()
+    graph.add_node("wrong-side", y=-6.20000, x=106.80000)
+    graph.add_node("right-side", y=-6.20002, x=106.80000)
+    graph.add_node("detour", y=-6.21000, x=106.80500)
+    graph.add_node("mosque-road", y=-6.20000, x=106.81000)
+    graph.add_edge("wrong-side", "detour", travel_time=100.0, length=900.0)
+    graph.add_edge("detour", "mosque-road", travel_time=100.0, length=900.0)
+    graph.add_edge("right-side", "mosque-road", travel_time=10.0, length=1100.0)
+    monkeypatch.setattr(
+        routing_osm,
+        "nearest_road_node_candidates_batch",
+        lambda _graph, _points, k: [["wrong-side", "right-side"], ["mosque-road"]],
+    )
+
+    start_node, mosque_node, route_nodes, _ = _best_snapped_route(
+        graph,
+        (-6.20000, 106.80000),
+        (-6.20000, 106.81000),
+        algorithm="dijkstra",
+    )
+
+    assert start_node == "right-side"
+    assert mosque_node == "mosque-road"
+    assert route_nodes == ["right-side", "mosque-road"]
+
+
+def test_route_geometry_is_oriented_in_path_direction():
+    import networkx as nx
+    from shapely.geometry import LineString
+
+    graph = nx.DiGraph()
+    graph.add_node("west", y=-6.20, x=106.80)
+    graph.add_node("east", y=-6.20, x=106.81)
+    # Some GraphML/OSM edges retain geometry in the opposite direction.
+    graph.add_edge(
+        "west",
+        "east",
+        length=1100.0,
+        geometry=LineString([(106.81, -6.20), (106.805, -6.201), (106.80, -6.20)]),
+    )
+
+    assert route_nodes_to_latlon(graph, ["west", "east"]) == [
+        (-6.20, 106.80),
+        (-6.201, 106.805),
+        (-6.20, 106.81),
+    ]

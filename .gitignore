@@ -5,6 +5,8 @@ venv/
 .env
 .DS_Store
 data/osm_cache/*.graphml
+data/osm_cache/*.runtime.pkl
+data/osm_cache/*.edges.pkl
 outputs/*.json
 data/processed/
 data/local_db/

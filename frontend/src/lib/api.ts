@@ -2,6 +2,30 @@ const API_BASE = typeof window !== "undefined"
   ? `http://${window.location.hostname}:8000`
   : "http://127.0.0.1:8000";
 
+export const RECOMMENDATION_CACHE_TTL_MS = 2 * 60 * 1000;
+export const SELECTED_ROUTE_CACHE_TTL_MS = 5 * 60 * 1000;
+const ROUTING_CACHE_VERSION = "v4-edge-snap-segments";
+
+const NEAREST_CACHE_TTL_MS = 30 * 1000;
+const MAX_NEAREST_CACHE_ENTRIES = 20;
+interface MosqueListResponse {
+  items?: Record<string, unknown>[];
+  total?: number;
+  [key: string]: unknown;
+}
+const nearestMosqueCache = new Map<string, { data: MosqueListResponse; cachedAt: number }>();
+let activeRouteToMosqueController: AbortController | null = null;
+
+export function isAbortError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
+}
+
+export function isRouteCacheFresh(entry: unknown, ttlMs: number): boolean {
+  if (!entry || typeof entry !== "object") return false;
+  const cachedAt = Number((entry as Record<string, unknown>)._cached_at || 0);
+  return cachedAt > 0 && Date.now() - cachedAt < ttlMs;
+}
+
 export function buildSelectedRouteCacheKey(
   datasetId: string,
   startLat: number,
@@ -9,7 +33,7 @@ export function buildSelectedRouteCacheKey(
   mosqueId: string,
   algorithm: string
 ) {
-  return `selected_${datasetId}_${startLat.toFixed(4)}_${startLon.toFixed(4)}_${mosqueId}_${algorithm}`;
+  return `selected_${ROUTING_CACHE_VERSION}_${datasetId}_${startLat.toFixed(5)}_${startLon.toFixed(5)}_${mosqueId}_${algorithm}`;
 }
 
 export async function fetchDatasets() {
@@ -18,10 +42,17 @@ export async function fetchDatasets() {
   return res.json();
 }
 
-export async function fetchMosques(datasetId: string, limit = 20, offset = 0, query = "", kabko = "") {
+export async function fetchMosques(
+  datasetId: string,
+  limit = 20,
+  offset = 0,
+  query = "",
+  kabko = "",
+  signal?: AbortSignal
+) {
   let url = `${API_BASE}/api/v1/mosques?dataset_id=${datasetId}&limit=${limit}&offset=${offset}`;
   if (kabko) url += `&kabko=${encodeURIComponent(kabko)}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal });
   if (!res.ok) throw new Error("Failed to fetch mosques");
   const data = await res.json();
   
@@ -67,26 +98,67 @@ export async function fetchNearestMosques(
   limit = 10,
   signal?: AbortSignal
 ) {
+  if (signal?.aborted) throw new DOMException("Request dibatalkan", "AbortError");
+
+  const cacheKey = [
+    datasetId,
+    lat.toFixed(4),
+    lng.toFixed(4),
+    radiusKm.toFixed(1),
+    limit,
+  ].join(":");
+  const cached = nearestMosqueCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < NEAREST_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
   const controller = new AbortController();
   const abortFromCaller = () => controller.abort();
   if (signal?.aborted) controller.abort();
   signal?.addEventListener("abort", abortFromCaller, { once: true });
-  const timeoutId = globalThis.setTimeout(() => controller.abort(), 5000);
+  let timedOut = false;
+  const timeoutId = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, 12000);
   try {
-    const res = await fetch(`${API_BASE}/api/v1/nearest-mosques`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        dataset_id: datasetId,
-        latitude: lat,
-        longitude: lng,
-        radius_km: radiusKm,
-        limit: limit
-      }),
-      signal: controller.signal
-    });
+    let res: Response | null = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        res = await fetch(`${API_BASE}/api/v1/nearest-mosques`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            dataset_id: datasetId,
+            latitude: lat,
+            longitude: lng,
+            radius_km: radiusKm,
+            limit: limit
+          }),
+          signal: controller.signal
+        });
+        break;
+      } catch (error) {
+        const isTransientNetworkFailure = error instanceof TypeError && !controller.signal.aborted;
+        if (!isTransientNetworkFailure || attempt === 1) throw error;
+        await new Promise(resolve => globalThis.setTimeout(resolve, 400));
+      }
+    }
+    if (!res) throw new Error("API pencarian masjid tidak dapat dihubungi");
     if (!res.ok) throw new Error("Failed to fetch nearest mosques");
-    return res.json();
+    const data = await res.json() as MosqueListResponse;
+    nearestMosqueCache.set(cacheKey, { data, cachedAt: Date.now() });
+    while (nearestMosqueCache.size > MAX_NEAREST_CACHE_ENTRIES) {
+      const oldestKey = nearestMosqueCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      nearestMosqueCache.delete(oldestKey);
+    }
+    return data;
+  } catch (error) {
+    if (timedOut && !signal?.aborted) {
+      throw new Error("Pencarian masjid terdekat melewati batas waktu");
+    }
+    throw error;
   } finally {
     globalThis.clearTimeout(timeoutId);
     signal?.removeEventListener("abort", abortFromCaller);
@@ -127,10 +199,16 @@ export async function routeToMosque(
   autoBuild = false,
   signal?: AbortSignal
 ) {
+  activeRouteToMosqueController?.abort();
   const controller = new AbortController();
+  activeRouteToMosqueController = controller;
   const abortFromCaller = () => controller.abort();
   if (signal?.aborted) controller.abort();
-  const timeoutId = globalThis.setTimeout(() => controller.abort(), 8000);
+  let timedOut = false;
+  const timeoutId = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, 15000);
   signal?.addEventListener("abort", abortFromCaller, { once: true });
   try {
     const res = await fetch(`${API_BASE}/api/v1/route/to-mosque`, {
@@ -153,9 +231,17 @@ export async function routeToMosque(
       throw new Error(errorData.detail || "Gagal menghitung rute ke masjid");
     }
     return res.json();
+  } catch (error) {
+    if (timedOut && !signal?.aborted) {
+      throw new Error("Perhitungan rute melewati batas waktu. Silakan coba lagi.");
+    }
+    throw error;
   } finally {
     globalThis.clearTimeout(timeoutId);
     signal?.removeEventListener("abort", abortFromCaller);
+    if (activeRouteToMosqueController === controller) {
+      activeRouteToMosqueController = null;
+    }
   }
 }
 

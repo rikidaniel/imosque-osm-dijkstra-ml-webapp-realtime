@@ -61,7 +61,7 @@ self.addEventListener("fetch", (event) => {
   // 4. API Backend → NetworkFirst (data realtime, fallback ke cache jika offline)
   if (url.pathname.startsWith("/api/") || url.hostname === "127.0.0.1" || url.hostname === "localhost") {
     if (url.port === "8000" || url.pathname.startsWith("/api/")) {
-      event.respondWith(networkFirst(event.request, API_CACHE, 6000));
+      event.respondWith(networkFirst(event.request, API_CACHE, 6000, event));
       return;
     }
   }
@@ -78,7 +78,7 @@ self.addEventListener("fetch", (event) => {
 
   // 4. Halaman HTML navigasi → NetworkFirst (agar selalu fresh)
   if (event.request.mode === "navigate") {
-    event.respondWith(networkFirst(event.request, STATIC_CACHE, 3000));
+    event.respondWith(networkFirst(event.request, STATIC_CACHE, 3000, event));
     return;
   }
 
@@ -111,32 +111,50 @@ async function cacheFirst(request, cacheName, maxAgeSeconds) {
 }
 
 // NetworkFirst: Coba network dulu dengan timeout, fallback ke cache
-async function networkFirst(request, cacheName, timeoutMs) {
-  const cache = await caches.open(cacheName);
+function networkFirst(request, cacheName, timeoutMs, event) {
+  let finishBackground;
+  const backgroundDone = new Promise((resolve) => {
+    finishBackground = resolve;
+  });
+  // Register synchronously while the FetchEvent is active. The response can
+  // return immediately after the network succeeds, while the cache write keeps
+  // the worker alive in the background.
+  event.waitUntil(backgroundDone);
 
-  try {
-    const response = await promiseTimeout(fetch(request), timeoutMs);
-    if (response.ok) {
-      // Clone dan simpan ke cache
-      const cloned = response.clone();
-      const headers = new Headers(cloned.headers);
-      headers.set("sw-cache-date", new Date().toISOString());
-      const body = await cloned.blob();
-      await cache.put(request, new Response(body, {
-        status: cloned.status,
-        statusText: cloned.statusText,
-        headers: headers,
-      }));
-      await trimCache(cache, MAX_STATIC_ENTRIES);
+  return (async () => {
+    let cache;
+    try {
+      cache = await caches.open(cacheName);
+      const response = await promiseTimeout(fetch(request), timeoutMs);
+      if (response.ok) {
+        cacheNetworkResponse(cache, request, response.clone())
+          .catch(() => undefined)
+          .finally(() => finishBackground());
+      } else {
+        finishBackground();
+      }
+      return response;
+    } catch {
+      finishBackground();
+      const cached = cache ? await cache.match(request) : null;
+      return cached || new Response(JSON.stringify({ error: "Offline" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      });
     }
-    return response;
-  } catch {
-    const cached = await cache.match(request);
-    return cached || new Response(JSON.stringify({ error: "Offline" }), {
-      status: 503,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+  })();
+}
+
+async function cacheNetworkResponse(cache, request, response) {
+  const headers = new Headers(response.headers);
+  headers.set("sw-cache-date", new Date().toISOString());
+  const body = await response.blob();
+  await cache.put(request, new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  }));
+  await trimCache(cache, MAX_STATIC_ENTRIES);
 }
 
 // StaleWhileRevalidate: Kembalikan cache langsung, update di background

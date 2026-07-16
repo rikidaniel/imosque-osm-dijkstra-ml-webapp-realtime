@@ -4,9 +4,13 @@ import math
 import os
 import threading
 import gc
+import pickle
+import tempfile
+import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
@@ -34,10 +38,240 @@ OVERPASS_ENDPOINTS = (
 
 Coordinate = Tuple[float, float]  # lat, lon
 
+
+@dataclass(frozen=True)
+class RoadEdgeSnap:
+    """Projection of a coordinate onto one physical road edge.
+
+    ``fraction`` follows the stored ``u -> v`` edge geometry: 0 is node ``u``
+    and 1 is node ``v``. Routing can therefore charge only the traversed part
+    of an edge without copying the full graph or inserting temporary nodes.
+    """
+
+    u: Any
+    v: Any
+    fraction: float
+    coordinate: Coordinate
+    connector_m: float
+
 _MAX_LOADED_GRAPHS = max(1, int(os.getenv("IMOSQUE_MAX_LOADED_GRAPHS", "1")))
+_MAX_EDGE_SNAP_CACHE_ENTRIES = max(
+    0, int(os.getenv("IMOSQUE_EDGE_SNAP_CACHE_SIZE", "20000"))
+)
 _loaded_graphs_cache: "OrderedDict[str, nx.Graph]" = OrderedDict()
 _graph_cache_lock = threading.RLock()
+_graph_runtime_state_lock = threading.RLock()
 _nearest_index_lock = threading.RLock()
+_nearest_edge_index_lock = threading.RLock()
+_nearest_edge_snap_cache_lock = threading.RLock()
+_graph_build_locks_lock = threading.Lock()
+_graph_build_locks: Dict[str, threading.Lock] = {}
+_graph_prewarm_lock = threading.Lock()
+_graph_prewarm_threads: Dict[str, threading.Thread] = {}
+_edge_index_persist_lock = threading.Lock()
+_edge_index_persist_threads: Dict[str, threading.Thread] = {}
+_graph_runtime_states: Dict[str, Dict[str, Any]] = {}
+_RUNTIME_CACHE_VERSION = 1
+_EDGE_INDEX_CACHE_VERSION = 1
+
+
+def runtime_graph_cache_path(graphml_path: Path = DEFAULT_GRAPHML) -> Path:
+    """Return the internal binary cache paired with a GraphML source file."""
+    graphml_path = Path(graphml_path)
+    return graphml_path.with_suffix(graphml_path.suffix + ".runtime.pkl")
+
+
+def edge_index_cache_path(graphml_path: Path = DEFAULT_GRAPHML) -> Path:
+    """Return the persistent Shapely edge-index cache paired with GraphML."""
+    graphml_path = Path(graphml_path)
+    return graphml_path.with_suffix(graphml_path.suffix + ".edges.pkl")
+
+
+def _graph_source_fingerprint(graphml_path: Path) -> Tuple[int, int]:
+    stat = Path(graphml_path).stat()
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _load_edge_index_cache(graphml_path: Path):
+    """Load a trusted local edge index only when its GraphML source still matches."""
+    cache_path = edge_index_cache_path(graphml_path)
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("rb") as handle:
+            payload = pickle.load(handle)
+        if not isinstance(payload, dict) or payload.get("version") != _EDGE_INDEX_CACHE_VERSION:
+            return None
+        if tuple(payload.get("source_fingerprint", ())) != _graph_source_fingerprint(graphml_path):
+            return None
+        index = payload.get("index")
+        if not isinstance(index, tuple) or len(index) != 3:
+            return None
+        tree, geometries, records = index
+        if tree is None or not hasattr(tree, "query") or len(geometries) != len(records) or not records:
+            return None
+        return index
+    except Exception:
+        # Rebuilding is always safe when a write was interrupted or Shapely changed.
+        return None
+
+
+def _write_edge_index_cache(graphml_path: Path, index) -> Path:
+    """Persist the immutable edge STRtree atomically."""
+    graphml_path = Path(graphml_path)
+    cache_path = edge_index_cache_path(graphml_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=cache_path.parent,
+            prefix=f".{cache_path.name}-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            pickle.dump(
+                {
+                    "version": _EDGE_INDEX_CACHE_VERSION,
+                    "source_fingerprint": _graph_source_fingerprint(graphml_path),
+                    "index": index,
+                },
+                handle,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, cache_path)
+        temp_path = None
+        return cache_path
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _persist_edge_index_in_background(graphml_path: Path, index) -> None:
+    """Write a newly built edge index without extending the interactive request."""
+    graphml_path = Path(graphml_path)
+    path_str = str(graphml_path.resolve())
+    with _edge_index_persist_lock:
+        existing = _edge_index_persist_threads.get(path_str)
+        if existing is not None and existing.is_alive():
+            return
+
+        def run() -> None:
+            try:
+                _write_edge_index_cache(graphml_path, index)
+            except Exception as exc:
+                print(f"Persistent edge index skipped: {exc}")
+            finally:
+                with _edge_index_persist_lock:
+                    if _edge_index_persist_threads.get(path_str) is threading.current_thread():
+                        _edge_index_persist_threads.pop(path_str, None)
+
+        thread = threading.Thread(
+            target=run,
+            name=f"imosque-edge-index-persist-{graphml_path.stem}",
+            daemon=True,
+        )
+        _edge_index_persist_threads[path_str] = thread
+        thread.start()
+
+
+def _load_runtime_graph_cache(graphml_path: Path):
+    """Load a trusted local runtime cache only when its GraphML fingerprint matches."""
+    cache_path = runtime_graph_cache_path(graphml_path)
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("rb") as handle:
+            payload = pickle.load(handle)
+        if not isinstance(payload, dict) or payload.get("version") != _RUNTIME_CACHE_VERSION:
+            return None
+        if tuple(payload.get("source_fingerprint", ())) != _graph_source_fingerprint(graphml_path):
+            return None
+        graph = payload.get("graph")
+        if graph is None or not hasattr(graph, "nodes") or not hasattr(graph, "edges"):
+            return None
+        return graph
+    except Exception:
+        # GraphML remains the source of truth when a partial/old pickle exists.
+        return None
+
+
+def _write_runtime_graph_cache(graphml_path: Path, graph) -> Path:
+    """Persist the compact graph atomically so a crash cannot expose a partial cache."""
+    graphml_path = Path(graphml_path)
+    cache_path = runtime_graph_cache_path(graphml_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=cache_path.parent,
+            prefix=f".{cache_path.name}-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            pickle.dump(
+                {
+                    "version": _RUNTIME_CACHE_VERSION,
+                    "source_fingerprint": _graph_source_fingerprint(graphml_path),
+                    "graph": graph,
+                },
+                handle,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, cache_path)
+        temp_path = None
+        return cache_path
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _set_graph_runtime_state(graphml_path: Path, **changes: Any) -> None:
+    path_str = str(Path(graphml_path).resolve())
+    with _graph_runtime_state_lock:
+        state = _graph_runtime_states.setdefault(path_str, {})
+        state.update(changes)
+
+
+def get_road_graph_status(graphml_path: Path = DEFAULT_GRAPHML) -> Dict[str, Any]:
+    """Expose whether a graph merely exists or is loaded and ready for requests."""
+    graphml_path = Path(graphml_path)
+    path_str = str(graphml_path.resolve())
+    exists = graphml_path.exists()
+    with _graph_runtime_state_lock:
+        state = dict(_graph_runtime_states.get(path_str, {}))
+    loaded = bool(state.get("ready", False))
+    if not exists:
+        status = "not_configured"
+    elif loaded:
+        status = "ready"
+    else:
+        status = state.get("status", "available")
+        if status == "ready":
+            status = "available"
+    result = {
+        "status": status,
+        "ready": bool(exists and loaded),
+        "cache_exists": exists,
+        "graphml_path": str(graphml_path),
+        "runtime_cache_exists": runtime_graph_cache_path(graphml_path).exists(),
+        "edge_index_cache_exists": edge_index_cache_path(graphml_path).exists(),
+    }
+    result.update({key: value for key, value in state.items() if key not in {"status", "ready"}})
+    return result
 
 
 def _cache_loaded_graph(path_str: str, graph):
@@ -46,7 +280,10 @@ def _cache_loaded_graph(path_str: str, graph):
         _loaded_graphs_cache[path_str] = graph
         _loaded_graphs_cache.move_to_end(path_str)
         while len(_loaded_graphs_cache) > _MAX_LOADED_GRAPHS:
-            _loaded_graphs_cache.popitem(last=False)
+            evicted_path, _ = _loaded_graphs_cache.popitem(last=False)
+            with _graph_runtime_state_lock:
+                evicted_state = _graph_runtime_states.setdefault(evicted_path, {})
+                evicted_state.update(status="available", ready=False)
     return graph
 
 
@@ -182,7 +419,7 @@ def _download_graph_from_overpass(ox, north: float, south: float, east: float, w
             ox.settings.requests_timeout = old_timeout
 
 
-def build_osm_graph_for_bbox(
+def _build_osm_graph_for_bbox_once(
     north: float,
     south: float,
     east: float,
@@ -268,16 +505,79 @@ def build_osm_graph_for_bbox(
     # Keep OSMnx's MultiDiGraph representation. Parallel carriageways are real
     # routing alternatives and ox.save_graphml requires keyed multigraph edges.
 
-    ox.save_graphml(G, filepath=output_graphml)
+    output_graphml = Path(output_graphml)
+    output_graphml.parent.mkdir(parents=True, exist_ok=True)
+    temporary_graphml: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_graphml.parent,
+            prefix=f".{output_graphml.stem}-",
+            suffix=output_graphml.suffix,
+            delete=False,
+        ) as handle:
+            temporary_graphml = Path(handle.name)
+        ox.save_graphml(G, filepath=temporary_graphml)
+        os.replace(temporary_graphml, output_graphml)
+        temporary_graphml = None
+    finally:
+        if temporary_graphml is not None:
+            try:
+                temporary_graphml.unlink(missing_ok=True)
+            except OSError:
+                pass
     G = _compact_graph_for_routing(G)
+    try:
+        _write_runtime_graph_cache(output_graphml, G)
+    except Exception as exc:
+        # A binary cache is an optimization; a valid GraphML build must still succeed.
+        print(f"Runtime graph cache skipped: {exc}")
     gc.collect()
     path_str = str(Path(output_graphml).resolve())
+    G._imosque_graphml_path = Path(output_graphml).resolve()
     _cache_loaded_graph(path_str, G)
     
     # Print optimization stats
     print(f"Graph optimized: {len(G.nodes)} nodes, {len(G.edges)} edges")
     
     return G
+
+
+def build_osm_graph_for_bbox(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    network_type: str = "drive",
+    output_graphml: Path = DEFAULT_GRAPHML,
+):
+    """Singleflight wrapper: only one writer may replace a dataset graph at a time."""
+    path_str = str(Path(output_graphml).resolve())
+    with _graph_build_locks_lock:
+        build_lock = _graph_build_locks.setdefault(path_str, threading.Lock())
+    with build_lock:
+        _set_graph_runtime_state(output_graphml, status="loading", ready=False, error=None)
+        try:
+            graph = _build_osm_graph_for_bbox_once(
+                north=north,
+                south=south,
+                east=east,
+                west=west,
+                network_type=network_type,
+                output_graphml=output_graphml,
+            )
+            _set_graph_runtime_state(
+                output_graphml,
+                status="ready",
+                ready=True,
+                source="fresh_build",
+                nodes=len(graph.nodes),
+                edges=len(graph.edges),
+                error=None,
+            )
+            return graph
+        except Exception as exc:
+            _set_graph_runtime_state(output_graphml, status="error", ready=False, error=str(exc)[:300])
+            raise
 
 
 def graph_bounds(G) -> Tuple[float, float, float, float]:
@@ -339,17 +639,47 @@ def load_road_graph(graphml_path: Path = DEFAULT_GRAPHML):
                 f"Cache road graph belum ada: {graphml_path}. "
                 "Jalankan scripts/build_osm_graph.py atau aktifkan auto_build_osm pada request /api/route."
             )
-        ox = _require_osmnx()
-        G = ox.load_graphml(filepath=graphml_path)
-        G = _compact_graph_for_routing(G)
-        gc.collect()
-        return _cache_loaded_graph(path_str, G)
+        _set_graph_runtime_state(graphml_path, status="loading", ready=False, error=None)
+        load_started = time.perf_counter()
+        try:
+            G = _load_runtime_graph_cache(graphml_path)
+            source = "runtime_binary"
+            if G is None:
+                ox = _require_osmnx()
+                G = ox.load_graphml(filepath=graphml_path)
+                G = _compact_graph_for_routing(G)
+                source = "graphml"
+                try:
+                    _write_runtime_graph_cache(graphml_path, G)
+                except Exception as exc:
+                    print(f"Runtime graph cache skipped: {exc}")
+            gc.collect()
+            G._imosque_graphml_path = Path(graphml_path).resolve()
+            G = _cache_loaded_graph(path_str, G)
+            _set_graph_runtime_state(
+                graphml_path,
+                status="ready",
+                ready=True,
+                source=source,
+                load_time_ms=round((time.perf_counter() - load_started) * 1000, 2),
+                nodes=len(G.nodes),
+                edges=len(G.edges),
+                error=None,
+            )
+            return G
+        except Exception as exc:
+            _set_graph_runtime_state(graphml_path, status="error", ready=False, error=str(exc)[:300])
+            raise
 
 
 def evict_road_graph(graphml_path: Path = DEFAULT_GRAPHML) -> None:
     """Release a graph built by an offline batch job from process memory."""
     with _graph_cache_lock:
-        _loaded_graphs_cache.pop(str(Path(graphml_path).resolve()), None)
+        path_str = str(Path(graphml_path).resolve())
+        _loaded_graphs_cache.pop(path_str, None)
+        with _graph_runtime_state_lock:
+            state = _graph_runtime_states.setdefault(path_str, {})
+            state.update(status="available" if Path(graphml_path).exists() else "not_configured", ready=False)
 
 
 def _nearest_node_index(G):
@@ -410,10 +740,272 @@ def nearest_road_nodes_batch(G, points: List[Coordinate]):
     return [node_ids[int(index)] for index in indices]
 
 
+def nearest_road_node_candidates_batch(G, points: List[Coordinate], k: int = 3):
+    """Return several nearby road-node candidates for each coordinate.
+
+    A single nearest node is ambiguous around divided roads, bridges, rivers, and
+    parallel carriageways. Routing can evaluate these candidates and retain the
+    reachable one with the lowest total access plus road cost.
+    """
+    if not points:
+        return []
+    mode, tree, node_ids = _nearest_node_index(G)
+    candidate_count = min(max(1, int(k)), len(node_ids))
+    if mode == "projected":
+        queries = np.asarray([(lon, lat) for lat, lon in points], dtype=float)
+    else:
+        queries = np.deg2rad(np.asarray(points, dtype=float))
+    _, indices = tree.query(queries, k=candidate_count)
+    indices = np.asarray(indices)
+    if indices.ndim == 1:
+        indices = indices.reshape(len(points), candidate_count)
+    return [
+        [node_ids[int(index)] for index in row]
+        for row in indices
+    ]
+
+
+def _nearest_edge_index(G):
+    """Build one reusable STRtree over physical road-edge geometries.
+
+    OSMnx simplifies roads into long edges. Indexing only their endpoint nodes
+    can make a road passing directly beside a coordinate appear hundreds of
+    metres away, especially near rivers, railways, and divided carriageways.
+    Reverse directed edges share one physical geometry record here; direction
+    is evaluated later against the original graph.
+    """
+    cached = getattr(G, "_imosque_nearest_edge_index", None)
+    if cached is not None:
+        return cached
+
+    with _nearest_edge_index_lock:
+        cached = getattr(G, "_imosque_nearest_edge_index", None)
+        if cached is not None:
+            return cached
+
+        graphml_path = getattr(G, "_imosque_graphml_path", None)
+        if graphml_path is not None:
+            load_started = time.perf_counter()
+            cached = _load_edge_index_cache(Path(graphml_path))
+            if cached is not None:
+                G._imosque_nearest_edge_index = cached
+                _set_graph_runtime_state(
+                    Path(graphml_path),
+                    edge_index_source="persistent_binary",
+                    edge_index_load_time_ms=round((time.perf_counter() - load_started) * 1000, 2),
+                )
+                return cached
+
+        from shapely.geometry import LineString
+        from shapely.strtree import STRtree
+
+        build_started = time.perf_counter()
+        geometries = []
+        records: List[Tuple[Any, Any]] = []
+        seen_physical_edges = set()
+        for u, v in G.edges():
+            if u == v:
+                continue
+            physical_key = frozenset((u, v))
+            if physical_key in seen_physical_edges:
+                continue
+            seen_physical_edges.add(physical_key)
+            coordinates = _edge_linestring(G, u, v)
+            if len(coordinates) < 2:
+                continue
+            try:
+                line = LineString([(lon, lat) for lat, lon in coordinates])
+            except Exception:
+                continue
+            if line.is_empty or line.length <= 0:
+                continue
+            geometries.append(line)
+            records.append((u, v))
+
+        if not geometries:
+            raise ValueError("Graph OSM tidak memiliki geometri edge yang dapat diindeks.")
+        cached = (STRtree(geometries), geometries, records)
+        G._imosque_nearest_edge_index = cached
+        if graphml_path is not None:
+            _set_graph_runtime_state(
+                Path(graphml_path),
+                edge_index_source="fresh_build",
+                edge_index_build_time_ms=round((time.perf_counter() - build_started) * 1000, 2),
+            )
+            _persist_edge_index_in_background(Path(graphml_path), cached)
+        return cached
+
+
+def nearest_road_edge_candidates_batch(
+    G,
+    points: List[Coordinate],
+    k: int = 4,
+    max_search_radius_m: float = 750.0,
+) -> List[List[RoadEdgeSnap]]:
+    """Project coordinates onto nearby road edges, ordered by access distance."""
+    if not points:
+        return []
+
+    from shapely.geometry import Point, box
+
+    tree, geometries, records = _nearest_edge_index(G)
+    candidate_count = max(1, int(k))
+    with _nearest_edge_snap_cache_lock:
+        snap_cache = getattr(G, "_imosque_edge_snap_cache", None)
+        if snap_cache is None:
+            snap_cache = OrderedDict()
+            G._imosque_edge_snap_cache = snap_cache
+    results: List[List[RoadEdgeSnap]] = []
+    for lat, lon in points:
+        cache_key = (
+            float(lat),
+            float(lon),
+            candidate_count,
+            float(max_search_radius_m),
+        )
+        if _MAX_EDGE_SNAP_CACHE_ENTRIES:
+            with _nearest_edge_snap_cache_lock:
+                cached_snaps = snap_cache.get(cache_key)
+                if cached_snaps is not None:
+                    snap_cache.move_to_end(cache_key)
+                    results.append(list(cached_snaps))
+                    continue
+
+        point = Point(float(lon), float(lat))
+        nearby_indices = set()
+        radius_m = 50.0
+        while radius_m <= max_search_radius_m and len(nearby_indices) < candidate_count * 4:
+            latitude_delta = radius_m / 111_320.0
+            longitude_delta = radius_m / (
+                111_320.0 * max(math.cos(math.radians(float(lat))), 0.05)
+            )
+            query_box = box(
+                float(lon) - longitude_delta,
+                float(lat) - latitude_delta,
+                float(lon) + longitude_delta,
+                float(lat) + latitude_delta,
+            )
+            nearby_indices.update(int(index) for index in tree.query(query_box))
+            radius_m *= 2.0
+
+        if not nearby_indices:
+            nearest_index = tree.query_nearest(point)
+            nearest_values = np.asarray(nearest_index).reshape(-1)
+            nearby_indices.update(int(index) for index in nearest_values)
+
+        snaps: List[RoadEdgeSnap] = []
+        for index in nearby_indices:
+            line = geometries[index]
+            try:
+                fraction = float(line.project(point, normalized=True))
+                projected = line.interpolate(fraction, normalized=True)
+                snapped_coordinate = (float(projected.y), float(projected.x))
+                connector_m = 1000.0 * haversine_km(
+                    float(lat), float(lon), snapped_coordinate[0], snapped_coordinate[1]
+                )
+            except Exception:
+                continue
+            u, v = records[index]
+            snaps.append(
+                RoadEdgeSnap(
+                    u=u,
+                    v=v,
+                    fraction=max(0.0, min(1.0, fraction)),
+                    coordinate=snapped_coordinate,
+                    connector_m=connector_m,
+                )
+            )
+
+        snaps.sort(key=lambda snap: (snap.connector_m, str(snap.u), str(snap.v)))
+        if not snaps:
+            raise ValueError("Tidak ada edge jalan terdekat untuk koordinat yang diminta.")
+        # Alternatives are useful for adjacent carriageways, but a much farther
+        # edge can create a fake shortcut through buildings or across water.
+        nearest_distance = snaps[0].connector_m
+        maximum_alternative_distance = max(
+            nearest_distance + 12.0,
+            nearest_distance * 1.75,
+        )
+        eligible = [
+            snap for snap in snaps
+            if snap.connector_m <= maximum_alternative_distance
+        ]
+        selected = eligible[:candidate_count] or snaps[:1]
+        if _MAX_EDGE_SNAP_CACHE_ENTRIES:
+            with _nearest_edge_snap_cache_lock:
+                snap_cache[cache_key] = tuple(selected)
+                snap_cache.move_to_end(cache_key)
+                while len(snap_cache) > _MAX_EDGE_SNAP_CACHE_ENTRIES:
+                    snap_cache.popitem(last=False)
+        results.append(list(selected))
+    return results
+
+
 def warm_road_graph_indexes(G) -> None:
-    """Precompute immutable lookup structures so the first user request is fast."""
+    """Precompute route-critical immutable lookup structures."""
     graph_bounds(G)
-    _nearest_node_index(G)
+    _nearest_edge_index(G)
+
+
+def prewarm_road_graph(graphml_path: Path = DEFAULT_GRAPHML) -> Dict[str, Any]:
+    """Synchronously load a graph and its spatial index, recording readiness timings."""
+    started = time.perf_counter()
+    _set_graph_runtime_state(graphml_path, status="loading", ready=False, error=None)
+    try:
+        graph = load_road_graph(graphml_path)
+        # load_road_graph marks the graph object ready for ordinary callers;
+        # prewarm keeps interactive routing in fallback mode until the edge
+        # index is also usable.
+        _set_graph_runtime_state(graphml_path, status="loading", ready=False, error=None)
+        index_started = time.perf_counter()
+        warm_road_graph_indexes(graph)
+        _set_graph_runtime_state(
+            graphml_path,
+            status="ready",
+            ready=True,
+            index_time_ms=round((time.perf_counter() - index_started) * 1000, 2),
+            prewarm_time_ms=round((time.perf_counter() - started) * 1000, 2),
+            error=None,
+        )
+    except Exception as exc:
+        _set_graph_runtime_state(graphml_path, status="error", ready=False, error=str(exc)[:300])
+        raise
+    return get_road_graph_status(graphml_path)
+
+
+def start_road_graph_prewarm(graphml_path: Path = DEFAULT_GRAPHML) -> bool:
+    """Start one background prewarm per graph path; return False if none is needed."""
+    graphml_path = Path(graphml_path)
+    path_str = str(graphml_path.resolve())
+    if not graphml_path.exists():
+        _set_graph_runtime_state(graphml_path, status="not_configured", ready=False, error=None)
+        return False
+    if get_road_graph_status(graphml_path)["ready"]:
+        return False
+    with _graph_prewarm_lock:
+        existing = _graph_prewarm_threads.get(path_str)
+        if existing is not None and existing.is_alive():
+            return False
+        _set_graph_runtime_state(graphml_path, status="loading", ready=False, error=None)
+
+        def run() -> None:
+            try:
+                prewarm_road_graph(graphml_path)
+            except Exception as exc:
+                print(f"Road graph preload skipped: {exc}")
+            finally:
+                with _graph_prewarm_lock:
+                    if _graph_prewarm_threads.get(path_str) is threading.current_thread():
+                        _graph_prewarm_threads.pop(path_str, None)
+
+        thread = threading.Thread(
+            target=run,
+            name=f"imosque-road-graph-preload-{graphml_path.stem}",
+            daemon=True,
+        )
+        _graph_prewarm_threads[path_str] = thread
+        thread.start()
+        return True
 
 
 def _edge_attribute_dicts(G, u, v) -> List[dict]:
@@ -435,10 +1027,48 @@ def _edge_linestring(G, u, v) -> List[Coordinate]:
     geom = edge_data.get("geometry")
     if geom is not None:
         try:
-            return [(float(lat), float(lon)) for lon, lat in geom.coords]
+            coordinates = [(float(lat), float(lon)) for lon, lat in geom.coords]
+            if len(coordinates) >= 2:
+                u_coordinate = (float(G.nodes[u]["y"]), float(G.nodes[u]["x"]))
+                v_coordinate = (float(G.nodes[v]["y"]), float(G.nodes[v]["x"]))
+
+                def endpoint_error(points: List[Coordinate]) -> float:
+                    return (
+                        (points[0][0] - u_coordinate[0]) ** 2
+                        + (points[0][1] - u_coordinate[1]) ** 2
+                        + (points[-1][0] - v_coordinate[0]) ** 2
+                        + (points[-1][1] - v_coordinate[1]) ** 2
+                    )
+
+                reversed_coordinates = list(reversed(coordinates))
+                if endpoint_error(reversed_coordinates) < endpoint_error(coordinates):
+                    coordinates = reversed_coordinates
+            return coordinates
         except Exception:
             pass
     return [(float(G.nodes[u]["y"]), float(G.nodes[u]["x"])), (float(G.nodes[v]["y"]), float(G.nodes[v]["x"]))]
+
+
+def edge_snap_segment_coordinates(
+    G,
+    snap: RoadEdgeSnap,
+    start_fraction: float,
+    end_fraction: float,
+) -> List[Coordinate]:
+    """Return the directed subsection of a snapped edge geometry."""
+    from shapely.geometry import LineString, Point
+    from shapely.ops import substring
+
+    coordinates = _edge_linestring(G, snap.u, snap.v)
+    if len(coordinates) < 2:
+        return [snap.coordinate]
+    line = LineString([(lon, lat) for lat, lon in coordinates])
+    start = max(0.0, min(1.0, float(start_fraction)))
+    end = max(0.0, min(1.0, float(end_fraction)))
+    segment = substring(line, start, end, normalized=True)
+    if isinstance(segment, Point):
+        return [(float(segment.y), float(segment.x))]
+    return [(float(lat), float(lon)) for lon, lat in segment.coords]
 
 
 def route_nodes_to_latlon(G, route_nodes: Sequence) -> List[Coordinate]:
@@ -478,12 +1108,9 @@ def path_travel_time_s(G, route_nodes: Sequence) -> float:
 
 def dijkstra_path(G, source, target, weight: str = "travel_time"):
     """Optimized Dijkstra with bidirectional search for 2x speedup."""
-    try:
-        # Use bidirectional Dijkstra for significant speedup
-        return nx.bidirectional_dijkstra(G, source, target, weight=weight)[1]
-    except Exception:
-        # Fallback to standard Dijkstra
-        return nx.dijkstra_path(G, source, target, weight=weight)
+    # Propagate NetworkXNoPath directly. Retrying the same disconnected graph
+    # with single-source Dijkstra only doubles the work before fallback routing.
+    return nx.bidirectional_dijkstra(G, source, target, weight=weight)[1]
 
 
 def astar_path(G, source, target, weight: str = "travel_time"):

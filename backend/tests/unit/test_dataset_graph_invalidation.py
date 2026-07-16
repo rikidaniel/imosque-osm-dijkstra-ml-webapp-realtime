@@ -6,7 +6,9 @@ from app.use_cases.dataset_usecases import DatasetUseCases
 
 def test_invalidate_osm_graph_removes_file_metadata_and_memory_cache(tmp_path, monkeypatch):
     graph_path = tmp_path / "road_graph_dataset.graphml"
+    runtime_cache_path = graph_path.with_suffix(graph_path.suffix + ".runtime.pkl")
     graph_path.write_text("graph", encoding="utf-8")
+    runtime_cache_path.write_bytes(b"runtime graph")
     mosque_repo = MagicMock()
     dataset_repo = MagicMock()
     evicted = []
@@ -17,5 +19,6 @@ def test_invalidate_osm_graph_removes_file_metadata_and_memory_cache(tmp_path, m
     use_cases.invalidate_osm_graph("Dataset Example")
 
     assert not graph_path.exists()
+    assert not runtime_cache_path.exists()
     assert evicted == [graph_path]
     dataset_repo.delete_osm_cache.assert_called_once_with("dataset_example")

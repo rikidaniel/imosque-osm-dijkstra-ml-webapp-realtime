@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useState } from "react";
 import { 
-  X, Navigation, Clock, Star, Info, CheckCircle2, AlertTriangle, AlertCircle, Compass, ChevronUp, ChevronDown,
+  X, Navigation, Clock, Star, Info, CheckCircle2, AlertTriangle, AlertCircle, Compass, ChevronDown,
   Car, Droplets, Users, User, Snowflake, Volume2, Wifi, Utensils, BookOpen
 } from "lucide-react";
 
@@ -94,11 +94,11 @@ export default function RouteResultPanel() {
           : [];
 
   return (
-    <Card className="w-full max-h-[90vh] md:max-h-[90vh] flex flex-col bg-white/95 dark:bg-slate-900/95 backdrop-blur-lg border border-slate-200/50 dark:border-slate-800/50 rounded-t-3xl rounded-b-none md:rounded-2xl shadow-xl overflow-hidden animate-in slide-in-from-bottom duration-300 md:animate-in md:slide-in-from-right">
+    <Card className="w-full max-h-[90vh] md:max-h-[90vh] flex flex-col bg-white/97 text-slate-900 backdrop-blur-lg border border-slate-200/80 rounded-t-3xl rounded-b-none md:rounded-2xl shadow-xl overflow-hidden animate-in slide-in-from-bottom duration-300 md:animate-in md:slide-in-from-right">
       
       {/* Mobile Drag Pill Handle */}
       <div 
-        className="md:hidden w-12 h-1 bg-slate-300 dark:bg-slate-700 rounded-full mx-auto my-2.5 shrink-0 cursor-pointer"
+        className="md:hidden w-12 h-1 bg-slate-300 rounded-full mx-auto my-2.5 shrink-0 cursor-pointer"
         onClick={() => setIsExpanded(!isExpanded)}
       />
 
@@ -144,6 +144,7 @@ export default function RouteResultPanel() {
             <Button 
               variant="ghost" 
               size="icon" 
+              aria-label="Batalkan rute"
               onClick={(e) => { e.stopPropagation(); handleClose(); }} 
               className="h-8 w-8 rounded-full text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
             >
@@ -156,7 +157,7 @@ export default function RouteResultPanel() {
       {/* 2. FULL EXPANDED VIEW (Desktop always, mobile when isExpanded) */}
       <div className={`${!isExpanded ? "hidden md:flex md:flex-col" : "flex flex-col"}`}>
         {/* Header */}
-        <CardHeader className="pb-3 border-b border-slate-100 dark:border-slate-800/80 flex flex-row items-center justify-between bg-gradient-to-r from-emerald-50/50 to-teal-50/30 dark:from-emerald-950/20 dark:to-teal-950/10 p-4">
+        <CardHeader className="pb-3 border-b border-slate-200/70 flex flex-row items-center justify-between bg-gradient-to-r from-emerald-50/80 to-teal-50/50 p-4">
           <div className="flex-1">
             <CardTitle className="text-sm font-bold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
               <Compass className="w-4 h-4 text-emerald-600 dark:text-emerald-400 animate-spin-slow" />
@@ -170,6 +171,7 @@ export default function RouteResultPanel() {
             <Button 
               variant="ghost" 
               size="icon" 
+              aria-label="Ciutkan detail rute"
               onClick={() => setIsExpanded(false)} 
               className="md:hidden h-7 w-7 rounded-full text-slate-400 hover:text-slate-600 hover:bg-slate-100/80 dark:hover:bg-slate-800"
             >
@@ -178,6 +180,7 @@ export default function RouteResultPanel() {
             <Button 
               variant="ghost" 
               size="icon" 
+              aria-label="Batalkan rute"
               onClick={handleClose} 
               className="h-7 w-7 rounded-full text-slate-400 hover:text-slate-600 hover:bg-slate-100/80 dark:hover:bg-slate-800"
             >
@@ -189,17 +192,17 @@ export default function RouteResultPanel() {
         <CardContent className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar max-h-[50vh] md:max-h-none">
           {/* Dynamic Route Info */}
           <div className="grid grid-cols-3 gap-2.5">
-            <div className="bg-slate-50/80 dark:bg-slate-900/60 p-2.5 rounded-xl border border-slate-100 dark:border-slate-800/80 text-center flex flex-col items-center">
+            <div className="bg-slate-50/90 p-2.5 rounded-xl border border-slate-200/70 text-center flex flex-col items-center">
               <Navigation className="w-4 h-4 text-emerald-600 mb-1" />
               <span className="text-[10px] text-slate-400 font-medium">Jarak</span>
               <span className="text-xs font-bold text-slate-800 dark:text-slate-200">{formatDistance(summary.distance_km)}</span>
             </div>
-            <div className="bg-slate-50/80 dark:bg-slate-900/60 p-2.5 rounded-xl border border-slate-100 dark:border-slate-800/80 text-center flex flex-col items-center">
+            <div className="bg-slate-50/90 p-2.5 rounded-xl border border-slate-200/70 text-center flex flex-col items-center">
               <Clock className="w-4 h-4 text-emerald-600 mb-1" />
               <span className="text-[10px] text-slate-400 font-medium">Total Waktu</span>
               <span className="text-xs font-bold text-slate-800 dark:text-slate-200">{Math.round(summary.estimated_time_minutes)} mnt</span>
             </div>
-            <div className="bg-slate-50/80 dark:bg-slate-900/60 p-2.5 rounded-xl border border-slate-100 dark:border-slate-800/80 text-center flex flex-col items-center">
+            <div className="bg-slate-50/90 p-2.5 rounded-xl border border-slate-200/70 text-center flex flex-col items-center">
               <Clock className="w-4 h-4 text-emerald-600 mb-1" />
               <span className="text-[10px] text-slate-400 font-medium">Ke Masjid</span>
               <span className="text-xs font-bold text-slate-800 dark:text-slate-200">{Math.round(summary.arrival_to_mosque_minutes)} mnt</span>
@@ -207,7 +210,7 @@ export default function RouteResultPanel() {
           </div>
 
           {/* Dynamic Prayer Timer Bar */}
-          <div className="bg-slate-50/50 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-800 rounded-xl p-3.5 space-y-2.5">
+          <div className="bg-slate-50/70 border border-slate-200 rounded-xl p-3.5 space-y-2.5">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">Waktu Kedatangan Shalat</span>
               <Badge className={`${statusColor} border-none text-white text-[10px] px-2 py-0.5 shadow-sm`}>
@@ -217,7 +220,7 @@ export default function RouteResultPanel() {
             </div>
             
             {/* Progress Bar */}
-            <div className="w-full bg-slate-100 dark:bg-slate-950 rounded-full h-2 overflow-hidden">
+            <div className="w-full bg-slate-200/80 rounded-full h-2 overflow-hidden">
               <div 
                 className={`h-full ${statusColor} rounded-full transition-all duration-500`}
                 style={{ width: `${progressPercent}%` }}
@@ -278,11 +281,11 @@ export default function RouteResultPanel() {
 
           {/* Alternative Candidates */}
           {candidates.length > 1 && (
-            <div className="space-y-2 pt-2 border-t dark:border-slate-800/80">
+            <div className="space-y-2 pt-2 border-t border-slate-200">
               <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">Alternatif Masjid Lainnya:</span>
               <div className="space-y-2">
                 {candidates.slice(1).map((cand: any, idx: number) => (
-                  <div key={idx} className="flex items-center justify-between p-2.5 bg-slate-50/50 hover:bg-slate-50 dark:bg-slate-900/20 dark:hover:bg-slate-900/40 border border-slate-200/50 dark:border-slate-800/40 rounded-xl transition-all duration-300">
+                  <div key={idx} className="flex items-center justify-between p-2.5 bg-slate-50/70 hover:bg-slate-100 border border-slate-200/70 rounded-xl transition-all duration-300">
                     <div className="flex-1 min-w-0 pr-2">
                       <span className="text-xs font-bold text-slate-700 dark:text-slate-300 truncate block">{cand.name}</span>
                       <span className="text-[9px] text-slate-400 dark:text-slate-500 font-medium block mt-0.5">

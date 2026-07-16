@@ -257,12 +257,14 @@ def _friendly_error(exc: Exception) -> str:
 @router.get("/health")
 def health() -> Dict[str, Any]:
     active = dataset_usecases.get_active_dataset_id()
-    from app.infrastructure.services.osm_graph import DEFAULT_GRAPHML
-    graph_status = "connected" if DEFAULT_GRAPHML.exists() else "not_configured"
+    from app.infrastructure.services.osm_graph import get_graphml_path, get_road_graph_status
+    graph_runtime = get_road_graph_status(get_graphml_path(active))
     return {
         "status": "healthy",
-        "graph_status": graph_status,
-        "version": "1.0.0",
+        "graph_status": graph_runtime["status"],
+        "graph_ready": graph_runtime["ready"],
+        "graph_runtime": graph_runtime,
+        "version": "4.0.0",
         "active_dataset_id": active,
     }
 
@@ -277,10 +279,17 @@ def datasets() -> Dict[str, Any]:
 def set_active_dataset(dataset_id: str = Form(...)) -> Dict[str, Any]:
     dataset_usecases.set_active_dataset_id(dataset_id)
     profile = dataset_usecases.get_dataset_profile(dataset_id)
+    from app.infrastructure.services.osm_graph import get_graphml_path, get_road_graph_status, start_road_graph_prewarm
+    graph_path = get_graphml_path(dataset_id)
+    prewarm_started = start_road_graph_prewarm(graph_path)
+    mosque_prewarm_started = routing_usecases.start_mosque_candidate_prewarm(dataset_id)
     return {
         "status": "success",
         "active_dataset_id": dataset_id,
         "profile": profile,
+        "graph_prewarm_started": prewarm_started,
+        "mosque_prewarm_started": mosque_prewarm_started,
+        "graph_runtime": get_road_graph_status(graph_path),
     }
 
 @router.post("/datasets/upload")
@@ -296,13 +305,20 @@ async def upload_dataset(
         raise HTTPException(status_code=400, detail="Hanya mendukung file CSV.")
     content = await file.read()
     try:
-        return dataset_usecases.upload_and_process_dataset(
+        result = dataset_usecases.upload_and_process_dataset(
             file_bytes=content,
             filename=file.filename,
             dataset_name=dataset_name,
             make_active=make_active,
             background_tasks=background_tasks
         )
+        # BackgroundTasks preserves insertion order: this snapshot starts only
+        # after the upload pipeline has committed its new data_revision.
+        background_tasks.add_task(
+            routing_usecases.start_mosque_candidate_prewarm,
+            result["dataset_id"],
+        )
+        return result
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -312,7 +328,9 @@ async def upload_dataset(
 def run_pipeline(dataset_id: Optional[str] = Query(None)) -> Dict[str, Any]:
     did = dataset_id or dataset_usecases.get_active_dataset_id()
     try:
-        return dataset_usecases.run_pipeline(did)
+        result = dataset_usecases.run_pipeline(did)
+        routing_usecases.start_mosque_candidate_prewarm(did)
+        return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -356,10 +374,12 @@ def dataset_bbox(dataset_id: str) -> Dict[str, Any]:
 
 @router.get("/osm/status")
 def osm_status(dataset_id: Optional[str] = Query(None)) -> Dict[str, Any]:
-    cache_id = dataset_id or "latest"
+    resolved_dataset_id = dataset_id or dataset_usecases.get_active_dataset_id()
+    cache_id = resolved_dataset_id or "latest"
     cache_meta = dataset_repo.get_osm_cache(cache_id)
-    from app.infrastructure.services.osm_graph import get_graphml_path
-    graph_path = get_graphml_path(dataset_id)
+    from app.infrastructure.services.osm_graph import get_graphml_path, get_road_graph_status
+    graph_path = get_graphml_path(resolved_dataset_id)
+    graph_runtime = get_road_graph_status(graph_path)
     import os
     size_mb = 0.0
     cache_exists = False
@@ -376,6 +396,7 @@ def osm_status(dataset_id: Optional[str] = Query(None)) -> Dict[str, Any]:
         "cache_path": str(graph_path),
         "size_mb": size_mb,
         "metadata": cache_meta,
+        "graph_runtime": graph_runtime,
         "note": "OSM data diambil dari OpenStreetMap melalui OSMnx."
     }
 
@@ -496,7 +517,15 @@ def build_osm_route(req: BuildOsmRouteRequest) -> Dict[str, Any]:
     if not _osm_graph_download_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Build graph lain sedang berjalan.")
     try:
-        return routing_usecases.build_osm_route(req.start_lat, req.start_lon, req.end_lat, req.end_lon, req.buffer_km, req.network_type, req.dataset_id)
+        return routing_usecases.build_osm_route(
+            start_lat=req.start_lat,
+            start_lon=req.start_lon,
+            end_lat=req.end_lat,
+            end_lon=req.end_lon,
+            buffer_km=req.buffer_km,
+            network_type=req.network_type,
+            dataset_id=req.dataset_id,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_friendly_error(exc))
     finally:
@@ -520,12 +549,14 @@ def delete_mosque(dataset_id: str, mosque_id: str) -> Dict[str, Any]:
     success = dataset_usecases.delete_mosque(dataset_id, mosque_id)
     if not success:
         raise HTTPException(status_code=404, detail="Masjid tidak ditemukan atau tidak dapat dihapus.")
+    routing_usecases.start_mosque_candidate_prewarm(dataset_id)
     return {"status": "success", "message": f"Masjid {mosque_id} berhasil dihapus."}
 
 @router.post("/mosques/{dataset_id}")
 def create_mosque(dataset_id: str, req: MosqueCreateRequest) -> Dict[str, Any]:
     try:
         mosque_id = dataset_usecases.create_mosque(dataset_id, req.dict(exclude_unset=True))
+        routing_usecases.start_mosque_candidate_prewarm(dataset_id)
         return {"status": "success", "mosque_id": mosque_id, "message": "Masjid berhasil ditambahkan."}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -536,6 +567,7 @@ def update_mosque(dataset_id: str, mosque_id: str, req: MosqueUpdateRequest) -> 
         success = dataset_usecases.update_mosque(dataset_id, mosque_id, req.dict(exclude_unset=True))
         if not success:
             raise HTTPException(status_code=404, detail="Masjid tidak ditemukan atau tidak dapat diperbarui.")
+        routing_usecases.start_mosque_candidate_prewarm(dataset_id)
         return {"status": "success", "message": f"Masjid {mosque_id} berhasil diperbarui."}
     except Exception as exc:
         if isinstance(exc, HTTPException):
@@ -547,6 +579,7 @@ def delete_mosques_bulk(req: BulkDeleteRequest) -> Dict[str, Any]:
     success = dataset_usecases.delete_mosques_bulk(req.dataset_id, req.mosque_ids)
     if not success:
         raise HTTPException(status_code=400, detail="Gagal menghapus masjid secara masal.")
+    routing_usecases.start_mosque_candidate_prewarm(req.dataset_id)
     return {"status": "success", "message": f"{len(req.mosque_ids)} masjid berhasil dihapus."}
 
 @router.delete("/datasets/{dataset_id}")

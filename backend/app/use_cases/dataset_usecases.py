@@ -10,7 +10,12 @@ from typing import Any, Dict, List, Optional
 from app.domain.repositories.mosque_repo import MosqueRepository
 from app.domain.repositories.dataset_repo import DatasetRepository
 from app.infrastructure.services.ml_enrichment_service import MLEnrichmentService, slugify_dataset_name
-from app.infrastructure.services.osm_graph import DATA_DIR, evict_road_graph, get_graphml_path
+from app.infrastructure.services.osm_graph import (
+    DATA_DIR,
+    evict_road_graph,
+    get_graphml_path,
+    runtime_graph_cache_path,
+)
 
 from fastapi import BackgroundTasks
 
@@ -20,19 +25,72 @@ class DatasetUseCases:
         self.dataset_repo = dataset_repo
         self._nearest_cache: "OrderedDict[tuple, tuple[float, Dict[str, Any]]]" = OrderedDict()
         self._nearest_cache_lock = threading.RLock()
+        self._nearest_inflight: Dict[tuple, threading.Event] = {}
+        self._nearest_generation: Dict[str, int] = {}
+        self._dataset_revision_lock = threading.RLock()
+
+    @staticmethod
+    def _read_data_revision(profile: Any) -> int:
+        if not isinstance(profile, dict):
+            return 0
+        try:
+            return max(0, int(profile.get("data_revision", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _invalidate_nearest_cache(self, dataset_id: str) -> None:
+        """Invalidate dataset-specific and cross-dataset nearest results."""
+        did = str(dataset_id or "all")
+        scopes = {"all"} if did == "all" else {did, "all"}
+        with self._nearest_cache_lock:
+            for scope in scopes:
+                self._nearest_generation[scope] = self._nearest_generation.get(scope, 0) + 1
+            stale_keys = [key for key in self._nearest_cache if key[0] in scopes]
+            for key in stale_keys:
+                self._nearest_cache.pop(key, None)
+
+    def _record_dataset_mutation(
+        self,
+        dataset_id: str,
+        *,
+        profile_updates: Optional[Dict[str, Any]] = None,
+        mosque_count_delta: Optional[int] = None,
+    ) -> int:
+        """Publish a monotonic revision and invalidate derived query results."""
+        did = slugify_dataset_name(dataset_id)
+        self._invalidate_nearest_cache(did)
+        with self._dataset_revision_lock:
+            current = self.dataset_repo.get_dataset(did)
+            current_profile = dict(current) if isinstance(current, dict) else {}
+            updates = dict(profile_updates or {})
+            current_revision = max(
+                self._read_data_revision(current_profile),
+                self._read_data_revision(updates),
+            )
+            payload = {**current_profile, **updates}
+            payload["dataset_id"] = did
+            payload["data_revision"] = current_revision + 1
+            if mosque_count_delta is not None:
+                try:
+                    mosque_count = int(current_profile.get("mosque_count", 0))
+                except (TypeError, ValueError):
+                    mosque_count = 0
+                payload["mosque_count"] = max(0, mosque_count + int(mosque_count_delta))
+            self.dataset_repo.upsert_dataset(did, payload)
+            return payload["data_revision"]
 
     def invalidate_osm_graph(self, dataset_id: str) -> None:
         """Remove road cache derived from a dataset whose contents changed."""
         did = slugify_dataset_name(dataset_id)
+        self._invalidate_nearest_cache(did)
         graph_path = get_graphml_path(did)
         evict_road_graph(graph_path)
         if graph_path.exists():
             graph_path.unlink()
+        binary_cache_path = runtime_graph_cache_path(graph_path)
+        if binary_cache_path.exists():
+            binary_cache_path.unlink()
         self.dataset_repo.delete_osm_cache(did)
-        with self._nearest_cache_lock:
-            stale_keys = [key for key in self._nearest_cache if key[0] == did]
-            for key in stale_keys:
-                self._nearest_cache.pop(key, None)
 
     def get_active_dataset_id(self) -> str:
         return self.dataset_repo.get_active_dataset_id()
@@ -62,6 +120,8 @@ class DatasetUseCases:
     ) -> Dict[str, Any]:
         base_name = dataset_name or filename or "dataset"
         did = slugify_dataset_name(base_name)
+        existing_profile = self.dataset_repo.get_dataset(did)
+        existing_revision = self._read_data_revision(existing_profile)
         
         # Simpan status awal (processing 10%)
         initial_profile = {
@@ -71,7 +131,8 @@ class DatasetUseCases:
             "processed": False,
             "processing_status": "processing",
             "progress_percent": 10,
-            "message": "Mengunggah file CSV..."
+            "message": "Mengunggah file CSV...",
+            "data_revision": existing_revision,
         }
         self.dataset_repo.upsert_dataset(did, initial_profile)
         
@@ -103,6 +164,7 @@ class DatasetUseCases:
                 profile['processing_status'] = "completed"
                 profile['progress_percent'] = 100
                 profile['message'] = "Selesai!"
+                profile['data_revision'] = existing_revision
                 
                 # Update status (80%)
                 self.dataset_repo.upsert_dataset(did, {
@@ -116,7 +178,7 @@ class DatasetUseCases:
                 self.invalidate_osm_graph(did)
                 
                 # Selesai! Update status ke completed
-                self.dataset_repo.upsert_dataset(did, profile)
+                self._record_dataset_mutation(did, profile_updates=profile)
                 
                 if make_active:
                     self.set_active_dataset_id(did)
@@ -236,49 +298,90 @@ class DatasetUseCases:
         }
 
     def get_nearest_mosques(self, dataset_id: str, lat: float, lon: float, radius_km: float, limit: int = 10) -> Dict[str, Any]:
-        # "all" = lintas semua dataset, jangan di-slugify menjadi filter yang salah
-        did = dataset_id if (not dataset_id or dataset_id.lower() == "all") else slugify_dataset_name(dataset_id)
-        max_radius = max(0.5, float(radius_km))
-        cache_key = (did, round(float(lat), 4), round(float(lon), 4), round(max_radius, 1), int(limit))
-        now = time.monotonic()
-        with self._nearest_cache_lock:
-            cached = self._nearest_cache.get(cache_key)
-            if cached and now - cached[0] <= 30.0:
-                self._nearest_cache.move_to_end(cache_key)
-                response = copy.deepcopy(cached[1])
-                response["origin"] = {"latitude": lat, "longitude": lon}
-                response["cache_hit"] = True
+        # "all" = lintas semua dataset, jangan di-slugify menjadi filter yang salah.
+        raw_dataset_id = str(dataset_id or "all").strip() or "all"
+        did = "all" if raw_dataset_id.lower() == "all" else slugify_dataset_name(raw_dataset_id)
+        origin_lat = float(lat)
+        origin_lon = float(lon)
+        max_radius = min(200.0, max(0.5, float(radius_km)))
+        safe_limit = min(50, max(1, int(limit)))
+
+        while True:
+            now = time.monotonic()
+            with self._nearest_cache_lock:
+                generation = self._nearest_generation.get(did, 0)
+                cache_key = (
+                    did,
+                    generation,
+                    round(origin_lat, 4),
+                    round(origin_lon, 4),
+                    round(max_radius, 1),
+                    safe_limit,
+                )
+                cached = self._nearest_cache.get(cache_key)
+                if cached and now - cached[0] <= 30.0:
+                    self._nearest_cache.move_to_end(cache_key)
+                    response = copy.deepcopy(cached[1])
+                    response["origin"] = {"latitude": origin_lat, "longitude": origin_lon}
+                    response["cache_hit"] = True
+                    return response
+
+                inflight = self._nearest_inflight.get(cache_key)
+                if inflight is None:
+                    inflight = threading.Event()
+                    self._nearest_inflight[cache_key] = inflight
+                    is_owner = True
+                else:
+                    is_owner = False
+
+            if not is_owner:
+                inflight.wait()
+                # The owner either populated the cache, failed, or was made
+                # obsolete by a dataset mutation. Re-evaluate all three cases.
+                continue
+
+            generation_is_current = False
+            try:
+                # One indexed database query at the caller's maximum radius.
+                items = self.mosque_repo.get_nearest_mosques(
+                    did,
+                    origin_lat,
+                    origin_lon,
+                    max_radius,
+                    safe_limit,
+                )
+                response = {
+                    "dataset_id": did,
+                    "origin": {"latitude": origin_lat, "longitude": origin_lon},
+                    "radius_km": max_radius,
+                    "search_radius_used_km": max_radius,
+                    "total": len(items),
+                    "items": items,
+                    "cache_hit": False,
+                }
+                with self._nearest_cache_lock:
+                    generation_is_current = self._nearest_generation.get(did, 0) == generation
+                    if generation_is_current:
+                        self._nearest_cache[cache_key] = (time.monotonic(), copy.deepcopy(response))
+                        while len(self._nearest_cache) > 512:
+                            self._nearest_cache.popitem(last=False)
+            finally:
+                with self._nearest_cache_lock:
+                    if self._nearest_inflight.get(cache_key) is inflight:
+                        self._nearest_inflight.pop(cache_key, None)
+                    inflight.set()
+
+            if generation_is_current:
                 return response
-        radii = []
-        for candidate_radius in (5.0, 15.0, max_radius):
-            effective = min(candidate_radius, max_radius)
-            if effective not in radii:
-                radii.append(effective)
-        items = []
-        used_radius = radii[-1]
-        for current_radius in radii:
-            items = self.mosque_repo.get_nearest_mosques(did, lat, lon, current_radius, limit)
-            used_radius = current_radius
-            if len(items) >= limit:
-                break
-        response = {
-            "dataset_id": did,
-            "origin": {"latitude": lat, "longitude": lon},
-            "radius_km": max_radius,
-            "search_radius_used_km": used_radius,
-            "total": len(items),
-            "items": items,
-            "cache_hit": False,
-        }
-        with self._nearest_cache_lock:
-            self._nearest_cache[cache_key] = (now, copy.deepcopy(response))
-            while len(self._nearest_cache) > 512:
-                self._nearest_cache.popitem(last=False)
-        return response
+            # A write raced this query. Retry against the new generation rather
+            # than returning a stale nearest result.
 
     def delete_mosque(self, dataset_id: str, mosque_id: str) -> bool:
         did = slugify_dataset_name(dataset_id)
-        return self.mosque_repo.delete_mosque(did, mosque_id)
+        success = self.mosque_repo.delete_mosque(did, mosque_id)
+        if success:
+            self._record_dataset_mutation(did, mosque_count_delta=-1)
+        return success
 
     def delete_dataset(self, dataset_id: str) -> bool:
         did = slugify_dataset_name(dataset_id)
@@ -314,15 +417,13 @@ class DatasetUseCases:
     def delete_mosques_bulk(self, dataset_id: str, mosque_ids: list[str]) -> bool:
         if not dataset_id:
             return False
+        if not mosque_ids:
+            return True
+        did = slugify_dataset_name(dataset_id)
         # Delete from repo
-        success = self.mosque_repo.delete_mosques_bulk(dataset_id, mosque_ids)
+        success = self.mosque_repo.delete_mosques_bulk(did, mosque_ids)
         if success:
-            # Update count in profile
-            profile = self.dataset_repo.get_dataset(dataset_id)
-            if profile:
-                current_count = profile.get("mosque_count", 0)
-                new_count = max(0, current_count - len(mosque_ids))
-                self.dataset_repo.upsert_dataset(dataset_id, {**profile, "mosque_count": new_count})
+            self._record_dataset_mutation(did, mosque_count_delta=-len(mosque_ids))
         return success
 
     def _sync_mosque_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -352,14 +453,13 @@ class DatasetUseCases:
         did = slugify_dataset_name(dataset_id)
         synced_data = self._sync_mosque_fields(dict(data))
         mosque_id = self.mosque_repo.create_mosque(did, synced_data)
-        # Update count in profile
-        profile = self.dataset_repo.get_dataset(did)
-        if profile:
-            current_count = profile.get("mosque_count", 0)
-            self.dataset_repo.upsert_dataset(did, {**profile, "mosque_count": current_count + 1})
+        self._record_dataset_mutation(did, mosque_count_delta=1)
         return mosque_id
 
     def update_mosque(self, dataset_id: str, mosque_id: str, data: Dict[str, Any]) -> bool:
         did = slugify_dataset_name(dataset_id)
         synced_data = self._sync_mosque_fields(dict(data))
-        return self.mosque_repo.update_mosque(did, mosque_id, synced_data)
+        success = self.mosque_repo.update_mosque(did, mosque_id, synced_data)
+        if success:
+            self._record_dataset_mutation(did)
+        return success

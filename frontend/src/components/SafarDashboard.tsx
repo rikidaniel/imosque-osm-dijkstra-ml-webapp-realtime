@@ -14,7 +14,18 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
-import { buildSelectedRouteCacheKey, fetchDatasets, fetchNearestMosques, fetchPrayerTimes, routeToMosque, fetchMosques } from "@/lib/api";
+import {
+  buildSelectedRouteCacheKey,
+  fetchDatasets,
+  fetchNearestMosques,
+  fetchPrayerTimes,
+  routeToMosque,
+  fetchMosques,
+  isAbortError,
+  isRouteCacheFresh,
+  RECOMMENDATION_CACHE_TTL_MS,
+  SELECTED_ROUTE_CACHE_TTL_MS,
+} from "@/lib/api";
 import { 
   Search, Settings, Clock, Compass, Navigation, Star, RotateCcw, X, MapPin, 
   Locate, Bell, BellOff, Volume2, VolumeX, CheckCircle2, AlertTriangle, AlertCircle, Shield
@@ -28,6 +39,8 @@ const MosqueDetailDrawer = dynamic(() => import("@/components/map/MosqueDetailDr
 const API_BASE = typeof window !== "undefined"
   ? `http://${window.location.hostname}:8000`
   : "http://127.0.0.1:8000";
+const LOCATION_FRESHNESS_MS = 5 * 60 * 1000;
+const NEAREST_DEBOUNCE_MS = 180;
 
 interface PrayerSchedule {
   name: string;
@@ -66,6 +79,8 @@ function decodePolyline(encoded: string): [number, number][] {
 export default function SafarDashboard() {
   const { 
     startPoint, 
+    startPointUpdatedAt,
+    startPointSource,
     endPoint, 
     setStartPoint, 
     setEndPoint, 
@@ -101,11 +116,12 @@ export default function SafarDashboard() {
   const [showSettings, setShowSettings] = useState(false);
   const [showPrayer, setShowPrayer] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [isLocating, setIsLocating] = useState(false);
   const [showLocationPopup, setShowLocationPopup] = useState(false);
-  const [isGpsChecking, setIsGpsChecking] = useState(false);
+  const [isGpsChecking, setIsGpsChecking] = useState(() => !startPoint && startPointSource !== "map");
+  const [gpsRefreshTick, setGpsRefreshTick] = useState(0);
   const [savingSettings, setSavingSettings] = useState(false);
   const [savingAlarmIndex, setSavingAlarmIndex] = useState<number | null>(null);
-  const [routingMosqueId, setRoutingMosqueId] = useState<string | null>(null);
 
   // Quick Filter States
   const [filterRating, setFilterRating] = useState(false);
@@ -120,7 +136,11 @@ export default function SafarDashboard() {
   const [nextPrayer, setNextPrayer] = useState({ name: "Maghrib", countdown: "00:00:00" });
   const [soundEnabled, setSoundEnabled] = useState(true);
 
-  const gpsAttempted = useRef(false);
+  const locationRequestRef = useRef(0);
+  const nearestRequestRef = useRef(0);
+  const selectedRouteRequestRef = useRef(0);
+  const routeToMosqueAbortRef = useRef<AbortController | null>(null);
+  const recommendationAbortRef = useRef<AbortController | null>(null);
 
   // Sync Local Settings with Store once loaded + auto-migrate nilai lama
   useEffect(() => {
@@ -155,78 +175,139 @@ export default function SafarDashboard() {
     }
   }, [startPoint]);
 
-  // Silent Geolocation check on initial load (only triggers if permission is already granted)
+  // Refresh a persisted GPS point in the background when it is stale. The
+  // request sequence prevents a late GPS callback from replacing a newer map
+  // click or manual location request.
   useEffect(() => {
-    if (typeof window !== "undefined" && navigator.permissions && navigator.geolocation && !startPoint) {
-      navigator.permissions.query({ name: "geolocation" as PermissionName }).then((result) => {
-        if (result.state === "granted") {
-          setIsGpsChecking(true);
-          // Safety timeout: jika GPS check tidak selesai dalam 8 detik, paksa reset
-          const safetyTimer = setTimeout(() => {
-            setIsGpsChecking(false);
-          }, 8000);
-          navigator.geolocation.getCurrentPosition(
-            (position) => {
-              clearTimeout(safetyTimer);
-              setStartPoint({
-                lat: position.coords.latitude,
-                lng: position.coords.longitude
-              });
-              setIsGpsChecking(false);
-            },
-            (error) => {
-              clearTimeout(safetyTimer);
-              console.warn("Silent GPS check failed:", error);
-              setIsGpsChecking(false);
-            },
-            { enableHighAccuracy: false, maximumAge: 300000, timeout: 4000 }
-          );
-        }
-      }).catch(err => {
-        console.warn("Permissions query not supported or failed:", err);
-      });
+    let cancelled = false;
+    if (startPoint && startPointSource === "map") return;
+    const hasFreshPoint = Boolean(
+      startPoint &&
+      startPointUpdatedAt &&
+      Date.now() - startPointUpdatedAt < LOCATION_FRESHNESS_MS
+    );
+
+    if (hasFreshPoint) {
+      return;
     }
-  }, [startPoint, setStartPoint]);
+
+    // Keep a stale persisted point usable while GPS refreshes. With no point,
+    // hold the fallback mosque request until permission status is known.
+    if (!navigator.geolocation || !navigator.permissions) {
+      Promise.resolve().then(() => setIsGpsChecking(false));
+      return;
+    }
+
+    navigator.permissions.query({ name: "geolocation" as PermissionName })
+      .then((permission) => {
+        if (cancelled || permission.state !== "granted") {
+          if (!cancelled) setIsGpsChecking(false);
+          return;
+        }
+
+        const requestId = ++locationRequestRef.current;
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            if (cancelled || requestId !== locationRequestRef.current) return;
+            setStartPoint(
+              { lat: position.coords.latitude, lng: position.coords.longitude },
+              position.timestamp || Date.now(),
+              "gps"
+            );
+            setIsGpsChecking(false);
+          },
+          (error) => {
+            if (cancelled || requestId !== locationRequestRef.current) return;
+            console.warn("Silent GPS check failed:", error);
+            setIsGpsChecking(false);
+          },
+          { enableHighAccuracy: false, maximumAge: LOCATION_FRESHNESS_MS, timeout: 4000 }
+        );
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          console.warn("Permissions query not supported or failed:", error);
+          setIsGpsChecking(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [gpsRefreshTick, startPoint, startPointSource, startPointUpdatedAt, setStartPoint]);
+
+  // Re-check stale location when the user returns to a tab that was left open.
+  useEffect(() => {
+    const refreshIfStale = () => {
+      if (document.visibilityState !== "visible") return;
+      const {
+        startPoint: point,
+        startPointSource: source,
+        startPointUpdatedAt: updatedAt,
+      } = useAppStore.getState();
+      if (source !== "map" && (!point || !updatedAt || Date.now() - updatedAt >= LOCATION_FRESHNESS_MS)) {
+        setGpsRefreshTick((tick) => tick + 1);
+      }
+    };
+    document.addEventListener("visibilitychange", refreshIfStale);
+    return () => document.removeEventListener("visibilitychange", refreshIfStale);
+  }, []);
+
+  useEffect(() => {
+    if (startPointSource === "map") return;
+    const age = startPointUpdatedAt ? Math.max(0, Date.now() - startPointUpdatedAt) : 0;
+    const delay = Math.min(
+      LOCATION_FRESHNESS_MS,
+      Math.max(1000, LOCATION_FRESHNESS_MS - age)
+    );
+    const timerId = window.setTimeout(() => setGpsRefreshTick((tick) => tick + 1), delay);
+    return () => window.clearTimeout(timerId);
+  }, [startPointSource, startPointUpdatedAt]);
 
   // Fetch Mosques based on startPoint, active dataset, and search settings
   useEffect(() => {
-    if (isGpsChecking) return; // Tunggu hingga deteksi GPS selesai
+    const requestId = ++nearestRequestRef.current;
+    const controller = new AbortController();
 
-    if (activeDatasetId) {
-      // Marker terdekat memakai radius hemat; backend memperluas 5 -> 15 km bila perlu.
-      const settingRadius = parseFloat(searchSettings.bufferKm);
-      const radius = isNaN(settingRadius) ? 15 : Math.min(Math.max(settingRadius, 5), 15);
-      // Limit tampilan sesuai dengan pengaturan Rekomendasi (maxCandidates)
-      const limit = parseInt(searchSettings.maxCandidates) || 10;
-      
-      if (startPoint) {
-        const controller = new AbortController();
-        console.log(`[fetchMosques] dataset=${activeDatasetId} lat=${startPoint.lat} lng=${startPoint.lng} radius=${radius}km limit=${limit}`);
-        fetchNearestMosques(activeDatasetId, startPoint.lat, startPoint.lng, radius, limit, controller.signal)
-          .then(res => {
-            console.log(`[fetchMosques] response total=${res.total} items=${res.items?.length}`);
-            setMosques(res.items || []);
-          })
-          .catch(err => {
-            if (err instanceof DOMException && err.name === "AbortError") return;
-            console.error("Gagal mengambil masjid terdekat:", err);
-            setMosques([]);
-          });
-        return () => controller.abort();
-      } else {
-        // Fallback: Ambil daftar masjid dari dataset jika startPoint tidak ada
-        fetchMosques(activeDatasetId, limit)
-          .then(res => {
-            setMosques(res.items || []);
-          })
-          .catch(err => {
-            console.error("Gagal mengambil daftar masjid:", err);
-            setMosques([]);
-          });
-      }
-    } else {
+    if (isGpsChecking && !startPoint) return () => controller.abort();
+    if (!activeDatasetId) {
       setMosques([]);
+      return () => controller.abort();
     }
+
+    const settingRadius = parseFloat(searchSettings.bufferKm);
+    const radius = isNaN(settingRadius) ? 15 : Math.min(Math.max(settingRadius, 2), 200);
+    const limit = parseInt(searchSettings.maxCandidates) || 10;
+    const debounceId = window.setTimeout(async () => {
+      try {
+        const response = startPoint
+          ? await fetchNearestMosques(
+              activeDatasetId,
+              startPoint.lat,
+              startPoint.lng,
+              radius,
+              limit,
+              controller.signal
+            )
+          : await fetchMosques(activeDatasetId, limit, 0, "", "", controller.signal);
+
+        if (requestId === nearestRequestRef.current && !controller.signal.aborted) {
+          setMosques(response.items || []);
+        }
+      } catch (error) {
+        if (isAbortError(error) || requestId !== nearestRequestRef.current) return;
+        console.error(
+          startPoint ? "Gagal mengambil masjid terdekat:" : "Gagal mengambil daftar masjid:",
+          error
+        );
+        setMosques([]);
+      }
+    }, startPoint ? NEAREST_DEBOUNCE_MS : 0);
+
+    return () => {
+      window.clearTimeout(debounceId);
+      controller.abort();
+    };
   }, [activeDatasetId, startPoint, isGpsChecking, searchSettings.bufferKm, searchSettings.maxCandidates, setMosques]);
 
   // Fetch Prayer Times based on location
@@ -316,28 +397,37 @@ export default function SafarDashboard() {
 
   // Handle manual destination route calculation (Dijkstra/A* using settings)
   const handleLocateMe = useCallback(() => {
-    setLoading(true);
+    const requestId = ++locationRequestRef.current;
+    setIsGpsChecking(false);
+    setIsLocating(true);
     if (!navigator.geolocation) {
       toast.error("Browser Anda tidak mendukung Geolocation.");
-      setLoading(false);
+      setIsLocating(false);
       return;
     }
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        setStartPoint({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        if (requestId !== locationRequestRef.current) return;
+        setStartPoint(
+          { lat: pos.coords.latitude, lng: pos.coords.longitude },
+          pos.timestamp || Date.now(),
+          "gps"
+        );
         toast.success("Lokasi berhasil diperbarui!");
-        setLoading(false);
+        setIsLocating(false);
         setShowLocationPopup(false);
       },
       async (err) => {
+        if (requestId !== locationRequestRef.current) return;
         console.warn("Mendeteksi lokasi gagal:", err);
-        setLoading(false);
+        setIsLocating(false);
         
         if (err.code === 1) { // PERMISSION_DENIED
           // Cek apakah izin sudah granted tapi GPS OS mati
           if (typeof navigator !== "undefined" && navigator.permissions) {
             try {
               const status = await navigator.permissions.query({ name: 'geolocation' });
+              if (requestId !== locationRequestRef.current) return;
               if (status.state === 'granted') {
                 // Browser sudah izinkan, tapi GPS OS/Windows mati
                 toast.error("Izin browser sudah OK, tapi GPS/Lokasi di perangkat/Windows Anda tampaknya dimatikan. Nyalakan Lokasi di Pengaturan OS.");
@@ -366,8 +456,12 @@ export default function SafarDashboard() {
 
   // Listen for permission changes so we auto-fetch if they manually unblock it
   useEffect(() => {
+    let cancelled = false;
+    let permissionStatus: PermissionStatus | null = null;
     if (typeof navigator !== "undefined" && navigator.permissions) {
       navigator.permissions.query({ name: 'geolocation' }).then((result) => {
+        if (cancelled) return;
+        permissionStatus = result;
         result.onchange = () => {
           if (result.state === 'granted') {
             handleLocateMe();
@@ -375,19 +469,25 @@ export default function SafarDashboard() {
         };
       }).catch(console.error);
     }
+    return () => {
+      cancelled = true;
+      if (permissionStatus) permissionStatus.onchange = null;
+    };
   }, [handleLocateMe]);
 
 
   const handleRouteToMosque = async (m: any) => {
     const requestedMosqueId = String(m.id || m.mosque_id || m.name);
-    if (routingMosqueId) return;
     if (!startPoint) {
       toast.error("Lokasi awal tidak ditemukan. Silakan izinkan akses lokasi (GPS) terlebih dahulu.");
       return;
     }
+    const requestId = ++selectedRouteRequestRef.current;
+    routeToMosqueAbortRef.current?.abort();
+    const controller = new AbortController();
+    routeToMosqueAbortRef.current = controller;
     const algoLabel = searchSettings.algorithm === "astar" ? "A*" : "Dijkstra";
     const toastId = toast.loading(`Mencari rute ${algoLabel} ke ${m.name}...`);
-    setRoutingMosqueId(requestedMosqueId);
     try {
       // Gunakan dataset_id masjid itu sendiri jika activeDatasetId adalah "all"
       // karena graph OSM dibangun per-dataset, bukan lintas dataset
@@ -398,7 +498,7 @@ export default function SafarDashboard() {
       const routeBuffer = Math.min(parseFloat(searchSettings.bufferKm) || 10, 50);
       const routeKey = buildSelectedRouteCacheKey(datasetForRoute, startPoint.lat, startPoint.lng, requestedMosqueId, searchSettings.algorithm);
       const cached = routeCache?.[routeKey];
-      if (cached && Date.now() - Number(cached._cached_at || 0) < 5 * 60 * 1000) {
+      if (isRouteCacheFresh(cached, SELECTED_ROUTE_CACHE_TTL_MS)) {
         setRouteData(cached);
         toast.success(`Rute (${algoLabel}) dimuat dari cache.`);
         return;
@@ -410,21 +510,31 @@ export default function SafarDashboard() {
         requestedMosqueId,
         searchSettings.algorithm,
         routeBuffer,
-        false
+        false,
+        controller.signal
       );
+      if (requestId !== selectedRouteRequestRef.current) return;
       setRouteData(data);
       setRouteCache(routeKey, data);
       toast.success(`Rute (${algoLabel}) ke ${m.name} berhasil ditemukan.`);
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toast.error(err.message || "Gagal menghitung rute navigasi.");
     } finally {
-      setRoutingMosqueId(null);
+      if (requestId === selectedRouteRequestRef.current) {
+        if (routeToMosqueAbortRef.current === controller) {
+          routeToMosqueAbortRef.current = null;
+        }
+      }
       toast.dismiss(toastId);
     }
   };
 
   const handleMapClick = useCallback((e: any) => {
-    setStartPoint({ lat: e.latlng.lat, lng: e.latlng.lng });
+    locationRequestRef.current += 1;
+    setIsGpsChecking(false);
+    setIsLocating(false);
+    setStartPoint({ lat: e.latlng.lat, lng: e.latlng.lng }, Date.now(), "map");
     setSelectedMosque(null);
     setRouteData(null);
     toast.success("Titik awal perjalanan diatur ke koordinat yang diklik.");
@@ -442,16 +552,23 @@ export default function SafarDashboard() {
 
     // Simpan localSettings ke store secara otomatis saat mencari rute
     setSearchSettings(localSettings);
+    const previousRecommendation = recommendationAbortRef.current;
+    previousRecommendation?.abort();
+    recommendationAbortRef.current = null;
+    if (previousRecommendation) setLoading(false);
 
-    const cacheKey = `${activeDatasetId}_${startPoint.lat.toFixed(5)}_${startPoint.lng.toFixed(5)}_${endPoint ? `${endPoint.lat.toFixed(5)}_${endPoint.lng.toFixed(5)}` : 'none'}_${localSettings.algorithm}_${localSettings.currentTime}_${localSettings.prayer}_${localSettings.profile}_${localSettings.maxCandidates}_${localSettings.bufferKm}`;
+    const cacheKey = `edge_v4_${activeDatasetId}_${startPoint.lat.toFixed(5)}_${startPoint.lng.toFixed(5)}_${endPoint ? `${endPoint.lat.toFixed(5)}_${endPoint.lng.toFixed(5)}` : 'none'}_${localSettings.algorithm}_${localSettings.currentTime}_${localSettings.prayer}_${localSettings.profile}_${localSettings.maxCandidates}_${localSettings.bufferKm}`;
 
-    if (routeCache && routeCache[cacheKey]) {
+    if (isRouteCacheFresh(routeCache?.[cacheKey], RECOMMENDATION_CACHE_TTL_MS)) {
       setRouteData(routeCache[cacheKey]);
       setShowSettings(false);
       toast.success("Rute teroptimal berhasil ditemukan (dari Cache Lokal).");
       return;
     }
 
+    const controller = new AbortController();
+    recommendationAbortRef.current = controller;
+    let timedOut = false;
     setLoading(true);
     try {
       const payload = {
@@ -477,8 +594,10 @@ export default function SafarDashboard() {
         compact_response: true,
       };
 
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => controller.abort(), 12000);
+      const timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, 12000);
       const res = await fetch(`${API_BASE}/api/v1/routes/recommend`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -492,6 +611,7 @@ export default function SafarDashboard() {
       }
 
       const data = await res.json();
+      if (recommendationAbortRef.current !== controller) return;
       setRouteData(data);
       if (setRouteCache) {
         setRouteCache(cacheKey, data);
@@ -499,12 +619,16 @@ export default function SafarDashboard() {
       setShowSettings(false);
       toast.success("Rute teroptimal berhasil ditemukan.");
     } catch (err: any) {
+      if (isAbortError(err) && !timedOut) return;
+      if (isAbortError(err) && timedOut) {
+        err = new Error("Pencarian rute melewati batas waktu. Silakan coba lagi.");
+      }
       // Offline fallback: cari cache yang mencakup koordinat start dan end yang sama
       const startKey = `${startPoint.lat.toFixed(5)}_${startPoint.lng.toFixed(5)}`;
       const endKey = endPoint ? `${endPoint.lat.toFixed(5)}_${endPoint.lng.toFixed(5)}` : startKey;
       
       const cachedMatch = Object.entries(routeCache || {}).find(([key]) => {
-        return key.includes(startKey) && key.includes(endKey);
+        return !key.startsWith("selected_") && key.includes(startKey) && key.includes(endKey);
       });
 
       if (cachedMatch) {
@@ -515,9 +639,32 @@ export default function SafarDashboard() {
         toast.error(err.message || "Gagal mencari rute. Silakan periksa koneksi internet Anda.");
       }
     } finally {
-      setLoading(false);
+      if (recommendationAbortRef.current === controller) {
+        recommendationAbortRef.current = null;
+        setLoading(false);
+      }
     }
   };
+
+  useEffect(() => {
+    return () => {
+      locationRequestRef.current += 1;
+      nearestRequestRef.current += 1;
+      selectedRouteRequestRef.current += 1;
+      routeToMosqueAbortRef.current?.abort();
+      recommendationAbortRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    selectedRouteRequestRef.current += 1;
+    routeToMosqueAbortRef.current?.abort();
+    recommendationAbortRef.current?.abort();
+  }, [activeDatasetId, startPoint?.lat, startPoint?.lng]);
+
+  useEffect(() => {
+    recommendationAbortRef.current?.abort();
+  }, [endPoint?.lat, endPoint?.lng]);
 
   const handleSaveSettings = async () => {
     const bufferKm = Number(localSettings.bufferKm);
@@ -590,54 +737,56 @@ export default function SafarDashboard() {
       seenIds.add("end-point");
     }
 
-    // Filter and add mosques
-    mosques.forEach(m => {
-      if (m.latitude && m.longitude) {
-        // Quick Filters check
-        if (filterRating) {
-          const r = parseFloat(String(m.rating || 0).replace(",", "."));
-          if (r < 4.8) return;
-        }
-        if (filterTierA && m.tier !== "A") return;
+    // Saat rute aktif, sembunyikan seluruh masjid lain agar jalur dan tujuan
+    // tetap terbaca jelas. Marker biasa kembali otomatis saat routeData ditutup.
+    if (!routeData) {
+      mosques.forEach(m => {
+        if (m.latitude && m.longitude) {
+          // Quick Filters check
+          if (filterRating) {
+            const r = parseFloat(String(m.rating || 0).replace(",", "."));
+            if (r < 4.8) return;
+          }
+          if (filterTierA && m.tier !== "A") return;
 
-        let rawFacs: string[] = [];
-        if (m.facilities) {
-          if (Array.isArray(m.facilities)) {
-            rawFacs = m.facilities.map((f: any) => String(f).toLowerCase());
-          } else if (typeof m.facilities === "string") {
-            rawFacs = m.facilities.split(/[|,;]+/).map((f: string) => f.trim().toLowerCase()).filter(Boolean);
+          let rawFacs: string[] = [];
+          if (m.facilities) {
+            if (Array.isArray(m.facilities)) {
+              rawFacs = m.facilities.map((f: any) => String(f).toLowerCase());
+            } else if (typeof m.facilities === "string") {
+              rawFacs = m.facilities.split(/[|,;]+/).map((f: string) => f.trim().toLowerCase()).filter(Boolean);
+            }
+          }
+          if (filterAC && !rawFacs.some(f => f.includes("ac"))) return;
+          if (filterParking && !rawFacs.some(f => f.includes("parking"))) return;
+          if (filterWudu && !rawFacs.some(f => f.includes("wudu"))) return;
+          if (filterToilet && !rawFacs.some(f => f.includes("toilet"))) return;
+
+          // Search Bar filter
+          if (searchQuery.trim() !== "") {
+            const q = searchQuery.toLowerCase();
+            const matchesName = m.name?.toLowerCase().includes(q);
+            const matchesAddress = m.address?.toLowerCase().includes(q);
+            if (!matchesName && !matchesAddress) return;
+          }
+
+          const mosqueId = m.id || m.mosque_id || m.name;
+          if (!seenIds.has(mosqueId)) {
+            markersList.push({
+              id: mosqueId,
+              lat: m.latitude,
+              lng: m.longitude,
+              type: "mosque",
+              tier: m.tier,
+              rating: m.rating,
+              facilities: m.facilities,
+              onClick: () => setSelectedMosque(m)
+            });
+            seenIds.add(mosqueId);
           }
         }
-        if (filterAC && !rawFacs.some(f => f.includes("ac"))) return;
-        if (filterParking && !rawFacs.some(f => f.includes("parking"))) return;
-        if (filterWudu && !rawFacs.some(f => f.includes("wudu"))) return;
-        if (filterToilet && !rawFacs.some(f => f.includes("toilet"))) return;
-
-        // Search Bar filter
-        if (searchQuery.trim() !== "") {
-          const q = searchQuery.toLowerCase();
-          const matchesName = m.name?.toLowerCase().includes(q);
-          const matchesAddress = m.address?.toLowerCase().includes(q);
-          if (!matchesName && !matchesAddress) return;
-        }
-
-        const isRec = routeData?.recommended_mosque?.id === m.id || routeData?.recommended_mosque?.mosque_id === m.id;
-        const mosqueId = m.id || m.mosque_id || m.name;
-        if (!isRec && !seenIds.has(mosqueId)) {
-          markersList.push({
-            id: mosqueId,
-            lat: m.latitude,
-            lng: m.longitude,
-            type: "mosque",
-            tier: m.tier,
-            rating: m.rating,
-            facilities: m.facilities,
-            onClick: () => setSelectedMosque(m)
-          });
-          seenIds.add(mosqueId);
-        }
-      }
-    });
+      });
+    }
 
     // Highlight recommended mosque
     if (routeData?.recommended_mosque) {
@@ -664,17 +813,38 @@ export default function SafarDashboard() {
     filterRating, filterTierA, filterAC, filterParking, filterWudu, filterToilet
   ]);
 
-  // Route Polyline
-  const routePoints = useMemo(() => {
+  // Road geometry and off-road access links are intentionally separate.
+  const routeSegments = useMemo(() => {
     const geoJson = routeData?.route_geojson || null;
-    if (geoJson?.geometry?.coordinates) {
-      return geoJson.geometry.coordinates.map((c: [number, number]) => [c[1], c[0]]) as [number, number][];
+    if (geoJson?.geometry?.type === "MultiLineString" && geoJson.geometry.coordinates) {
+      return geoJson.geometry.coordinates.map((segment: [number, number][]) =>
+        segment.map((c: [number, number]) => [c[1], c[0]] as [number, number])
+      ) as [number, number][][];
     }
-    return routeData?.encoded_polyline ? decodePolyline(routeData.encoded_polyline) : null;
+    if (geoJson?.geometry?.type === "LineString" && geoJson.geometry.coordinates) {
+      return [geoJson.geometry.coordinates.map((c: [number, number]) => [c[1], c[0]] as [number, number])];
+    }
+    if (Array.isArray(routeData?.encoded_polylines) && routeData.encoded_polylines.length > 0) {
+      return routeData.encoded_polylines.map((encoded: string) => decodePolyline(encoded));
+    }
+    return routeData?.encoded_polyline ? [decodePolyline(routeData.encoded_polyline)] : [];
+  }, [routeData]);
+  const routePoints = useMemo(() => routeSegments.flat(), [routeSegments]);
+  const accessConnectors = useMemo(() => {
+    if (!Array.isArray(routeData?.access_connectors)) return [];
+    return routeData.access_connectors
+      .filter((segment: unknown) => Array.isArray(segment) && segment.length >= 2)
+      .map((segment: [number, number][]) => segment.map(
+        (coordinate: [number, number]) => [Number(coordinate[0]), Number(coordinate[1])] as [number, number]
+      ));
   }, [routeData]);
 
   // Memoize map center to prevent MapViewer re-rendering on every Dashboard re-render (like clock tick)
   const mapCenter = useMemo(() => startPoint ? [startPoint.lat, startPoint.lng] as [number, number] : undefined, [startPoint?.lat, startPoint?.lng]);
+  const mapSearchRadiusKm = useMemo(() => {
+    const parsed = Number(searchSettings.bufferKm);
+    return Number.isFinite(parsed) ? Math.min(Math.max(parsed, 2), 200) : 10;
+  }, [searchSettings.bufferKm]);
 
   return (
     <main suppressHydrationWarning className="relative h-screen w-screen overflow-hidden bg-slate-50">
@@ -684,7 +854,10 @@ export default function SafarDashboard() {
           onMapClick={handleMapClick}
           markers={filteredMarkers}
           route={routePoints}
+          routeSegments={routeSegments}
+          accessConnectors={accessConnectors}
           center={mapCenter}
+          searchRadiusKm={mapSearchRadiusKm}
           routingMode={routeData?.routing_mode}
         />
       </div>
@@ -1032,11 +1205,11 @@ export default function SafarDashboard() {
       <div className="absolute bottom-[90px] right-4 z-[1000] pointer-events-auto">
         <button
           onClick={handleLocateMe}
-          disabled={loading}
+          disabled={isLocating}
           className="bg-white/95 backdrop-blur-md text-slate-700 hover:bg-emerald-50 hover:text-emerald-600 border border-slate-200/50 w-[42px] h-[42px] rounded-2xl shadow-xl flex items-center justify-center transition-all disabled:opacity-50"
           title="Lokasi Saya"
         >
-          {loading ? <div className="w-5 h-5 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin"></div> : <Locate className="w-[22px] h-[22px]" />}
+          {isLocating ? <div className="w-5 h-5 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin"></div> : <Locate className="w-[22px] h-[22px]" />}
         </button>
       </div>
 
@@ -1078,10 +1251,10 @@ export default function SafarDashboard() {
           <DialogFooter className="sm:justify-center mt-4 gap-2 flex-col sm:flex-row w-full">
             <Button 
               onClick={handleLocateMe}
-              disabled={loading}
+              disabled={isLocating}
               className="bg-blue-600 hover:bg-blue-700 text-white w-full sm:flex-1 rounded-xl font-bold h-11 sm:h-12 text-sm flex items-center justify-center gap-2 transition-all"
             >
-              {loading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : <Locate className="w-4 h-4 sm:w-5 sm:h-5" />}
+              {isLocating ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : <Locate className="w-4 h-4 sm:w-5 sm:h-5" />}
               Aktifkan Sekarang
             </Button>
             <Button 

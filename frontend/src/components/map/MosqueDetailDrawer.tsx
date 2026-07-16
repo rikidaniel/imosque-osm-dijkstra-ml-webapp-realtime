@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "@/lib/store";
 import { formatDistance } from "@/lib/utils";
 import { 
@@ -10,7 +10,13 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
-import { buildSelectedRouteCacheKey, routeToMosque } from "@/lib/api";
+import {
+  buildSelectedRouteCacheKey,
+  isAbortError,
+  isRouteCacheFresh,
+  routeToMosque,
+  SELECTED_ROUTE_CACHE_TTL_MS,
+} from "@/lib/api";
 
 // Helper function to map facilities to icons/labels
 const getFacilityBadge = (fac: string) => {
@@ -32,6 +38,9 @@ const getFacilityBadge = (fac: string) => {
 export default function MosqueDetailDrawer() {
   const { selectedMosque, setSelectedMosque, startPoint, activeDatasetId, setRouteData, searchSettings, routeCache, setRouteCache } = useAppStore();
   const [isRouting, setIsRouting] = useState(false);
+  const routeAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => routeAbortRef.current?.abort(), []);
 
   if (!selectedMosque) return null;
 
@@ -55,6 +64,9 @@ export default function MosqueDetailDrawer() {
     }
     const algoLabel = searchSettings.algorithm === "astar" ? "A*" : "Dijkstra";
     const toastId = toast.loading(`Menghitung rute optimal (${algoLabel}) ke ${m.name}...`);
+    routeAbortRef.current?.abort();
+    const controller = new AbortController();
+    routeAbortRef.current = controller;
     setIsRouting(true);
     try {
       // Gunakan dataset_id masjid itu sendiri jika activeDatasetId adalah "all"
@@ -66,7 +78,7 @@ export default function MosqueDetailDrawer() {
       const mosqueId = String(m.id || m.mosque_id || m.name);
       const routeKey = buildSelectedRouteCacheKey(datasetForRoute, startPoint.lat, startPoint.lng, mosqueId, searchSettings.algorithm);
       const cached = routeCache?.[routeKey];
-      if (cached && Date.now() - Number(cached._cached_at || 0) < 5 * 60 * 1000) {
+      if (isRouteCacheFresh(cached, SELECTED_ROUTE_CACHE_TTL_MS)) {
         setRouteData(cached);
         setSelectedMosque(null);
         toast.success(`Rute (${algoLabel}) dimuat dari cache.`);
@@ -79,16 +91,21 @@ export default function MosqueDetailDrawer() {
         mosqueId,
         searchSettings.algorithm,
         routeBuffer,
-        false
+        false,
+        controller.signal
       );
       setRouteData(data);
       setRouteCache(routeKey, data);
       setSelectedMosque(null); // Close drawer on route search success
       toast.success(`Rute (${algoLabel}) ke ${m.name} berhasil ditemukan.`);
     } catch (err: any) {
+      if (isAbortError(err)) return;
       toast.error(err.message || "Gagal menghitung rute navigasi.");
     } finally {
-      setIsRouting(false);
+      if (routeAbortRef.current === controller) {
+        routeAbortRef.current = null;
+        setIsRouting(false);
+      }
       toast.dismiss(toastId);
     }
   };
@@ -109,10 +126,10 @@ export default function MosqueDetailDrawer() {
   return (
     <div className="fixed inset-x-0 bottom-0 md:left-4 md:right-auto md:bottom-4 md:w-[400px] z-50 animate-in slide-in-from-bottom duration-300 pointer-events-auto">
       {/* Background glass card */}
-      <div className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border border-slate-200/60 dark:border-slate-800/60 rounded-t-3xl md:rounded-3xl shadow-2xl overflow-hidden max-h-[85vh] md:max-h-[700px] flex flex-col">
+      <div className="bg-white/97 text-slate-900 backdrop-blur-md border border-slate-200/80 rounded-t-3xl md:rounded-3xl shadow-2xl overflow-hidden max-h-[85vh] md:max-h-[700px] flex flex-col">
         
         {/* Decorative drag handle for mobile */}
-        <div className="w-12 h-1.5 bg-slate-300 dark:bg-slate-700 rounded-full mx-auto my-3 md:hidden"></div>
+        <div className="w-12 h-1.5 bg-slate-300 rounded-full mx-auto my-3 md:hidden"></div>
 
         {/* Cover image area */}
         <div className="relative h-44 bg-gradient-to-r from-emerald-800 via-emerald-950 to-teal-900 shrink-0">
@@ -130,6 +147,7 @@ export default function MosqueDetailDrawer() {
 
           {/* Close button */}
           <button 
+            aria-label="Tutup detail masjid"
             onClick={() => setSelectedMosque(null)}
             className="absolute top-4 right-4 p-2 rounded-full bg-slate-950/40 hover:bg-slate-950/60 text-white backdrop-blur-sm transition-colors border-0 cursor-pointer"
           >
@@ -219,10 +237,10 @@ export default function MosqueDetailDrawer() {
         </div>
 
         {/* Footer Actions */}
-        <div className="p-6 bg-slate-50 dark:bg-slate-900/50 border-t border-slate-100 dark:border-slate-800/80 shrink-0 flex gap-3">
+        <div className="p-6 bg-slate-50/90 border-t border-slate-200/70 shrink-0 flex gap-3">
           <Button 
             variant="outline" 
-            className="flex-1 text-slate-700 dark:text-slate-300 rounded-xl"
+            className="flex-1 bg-white text-slate-700 border-slate-300 hover:bg-slate-100 rounded-xl"
             onClick={() => setSelectedMosque(null)}
           >
             Batal

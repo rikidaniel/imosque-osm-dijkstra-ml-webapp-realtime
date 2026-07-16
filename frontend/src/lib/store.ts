@@ -12,6 +12,8 @@ interface SearchSettings {
   autoBuild: boolean;
 }
 
+type StartPointSource = "gps" | "map";
+
 interface AppState {
   // Datasets
   datasets: any[];
@@ -25,8 +27,14 @@ interface AppState {
 
   // Routing Map State
   startPoint: { lat: number, lng: number } | null;
+  startPointUpdatedAt: number | null;
+  startPointSource: StartPointSource | null;
   endPoint: { lat: number, lng: number } | null;
-  setStartPoint: (pt: { lat: number, lng: number } | null) => void;
+  setStartPoint: (
+    pt: { lat: number, lng: number } | null,
+    updatedAt?: number,
+    source?: StartPointSource
+  ) => void;
   setEndPoint: (pt: { lat: number, lng: number } | null) => void;
   
   routeData: any | null;
@@ -69,8 +77,14 @@ export const useAppStore = create<AppState>()(
       setMosques: (mosques) => set({ mosques }),
 
       startPoint: null,
+      startPointUpdatedAt: null,
+      startPointSource: null,
       endPoint: null,
-      setStartPoint: (pt) => set({ startPoint: pt }),
+      setStartPoint: (pt, updatedAt = Date.now(), source = "map") => set({
+        startPoint: pt,
+        startPointUpdatedAt: pt ? updatedAt : null,
+        startPointSource: pt ? source : null,
+      }),
       setEndPoint: (pt) => set({ endPoint: pt }),
 
       routeData: null,
@@ -160,10 +174,16 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "imosque-app-store",
-      version: 3,
-      migrate: (persistedState) => persistedState as AppState,
+      version: 6,
+      migrate: (persistedState) => ({
+        ...(persistedState as AppState),
+        routeCache: {},
+        routeData: null,
+      }),
       partialize: (state) => ({
         startPoint: state.startPoint,
+        startPointUpdatedAt: state.startPointUpdatedAt,
+        startPointSource: state.startPointSource,
         endPoint: state.endPoint,
         searchSettings: state.searchSettings,
         activeDatasetId: state.activeDatasetId,

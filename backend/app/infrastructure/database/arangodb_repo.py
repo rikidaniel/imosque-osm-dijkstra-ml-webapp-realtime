@@ -29,9 +29,30 @@ class ArangoMosqueRepository(MosqueRepository):
                 cls._lookup_cache.clear()
             cls._lookup_cache[(dataset_id, mosque_id)] = copy.deepcopy(mosque)
 
+    @classmethod
+    def _invalidate_lookup_cache(
+        cls,
+        dataset_id: str,
+        mosque_ids: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Invalidate cached lookups after a successful write."""
+        dataset_key = str(dataset_id or "")
+        with cls._lookup_cache_lock:
+            if mosque_ids is not None:
+                for mosque_id in mosque_ids:
+                    cls._lookup_cache.pop((dataset_key, str(mosque_id)), None)
+                return
+            stale_keys = [key for key in cls._lookup_cache if key[0] == dataset_key]
+            for key in stale_keys:
+                cls._lookup_cache.pop(key, None)
+
     def save_mosques(self, dataset_id: str, mosques: List[Dict[str, Any]]) -> None:
         db = get_db()
         col = db.collection('Mosque')
+
+        # An overwrite can replace fields from previously cached documents and
+        # can also remove IDs when called after a dataset refresh.
+        self._invalidate_lookup_cache(dataset_id)
         
         # Batch insert/upsert mosques
         for m in mosques:
@@ -329,16 +350,22 @@ class ArangoMosqueRepository(MosqueRepository):
         key = f"{dataset_id}_{mosque_id}"
         try:
             db.collection('Mosque').delete(key)
-            with self._lookup_cache_lock:
-                self._lookup_cache.pop((dataset_id, mosque_id), None)
+        except Exception:
+            return False
+
+        self._invalidate_lookup_cache(dataset_id, [mosque_id])
+        try:
             db.aql.execute("""
                 FOR edge IN LOCATED_IN_VILLAGE
                     FILTER edge._from == @m_id
                     REMOVE edge IN LOCATED_IN_VILLAGE
             """, bind_vars={"m_id": f"Mosque/{key}"})
-            return True
-        except Exception:
-            return False
+        except Exception as exc:
+            # The source document is already gone. Keep the mutation visible
+            # to callers so higher-level caches/revisions are invalidated;
+            # dangling edges can be cleaned independently.
+            print(f"Warning: failed to delete mosque edges for {key}: {exc}")
+        return True
 
     def delete_mosques_bulk(self, dataset_id: str, mosque_ids: list[str]) -> bool:
         db = get_db()
@@ -351,8 +378,13 @@ class ArangoMosqueRepository(MosqueRepository):
                 FOR key IN @keys
                     REMOVE key IN Mosque
             """, bind_vars={"keys": keys})
-            
-            # Delete related edges
+        except Exception as exc:
+            print(f"Error in delete_mosques_bulk: {exc}")
+            return False
+
+        self._invalidate_lookup_cache(dataset_id, mosque_ids)
+        try:
+            # Delete related edges after the primary documents are gone.
             db.aql.execute("""
                 FOR key IN @keys
                     LET m_id = CONCAT('Mosque/', key)
@@ -360,10 +392,9 @@ class ArangoMosqueRepository(MosqueRepository):
                         FILTER edge._from == m_id
                         REMOVE edge IN LOCATED_IN_VILLAGE
             """, bind_vars={"keys": keys})
-            return True
-        except Exception as e:
-            print(f"Error in delete_mosques_bulk: {e}")
-            return False
+        except Exception as exc:
+            print(f"Warning: failed to delete mosque edges in bulk: {exc}")
+        return True
 
     def delete_all_mosques(self, dataset_id: str) -> None:
         db = get_db()
@@ -376,10 +407,7 @@ class ArangoMosqueRepository(MosqueRepository):
                     FILTER edge._from == m_id
                     REMOVE edge IN LOCATED_IN_VILLAGE
         """, bind_vars={"did": dataset_id})
-        with self._lookup_cache_lock:
-            stale_keys = [key for key in self._lookup_cache if key[0] == dataset_id]
-            for key in stale_keys:
-                self._lookup_cache.pop(key, None)
+        self._invalidate_lookup_cache(dataset_id)
 
     def create_mosque(self, dataset_id: str, data: Dict[str, Any]) -> str:
         db = get_db()
@@ -401,6 +429,7 @@ class ArangoMosqueRepository(MosqueRepository):
             doc['priority_score'] = 1.0
             
         col.insert(doc, overwrite=True)
+        self._cache_mosque(doc)
         return mosque_id
 
     def update_mosque(self, dataset_id: str, mosque_id: str, data: Dict[str, Any]) -> bool:
@@ -414,10 +443,20 @@ class ArangoMosqueRepository(MosqueRepository):
                 return False
                 
             update_data = {**data}
-            if 'latitude' in update_data and 'longitude' in update_data:
-                update_data['coordinate'] = [float(update_data['longitude']), float(update_data['latitude'])]
-                
-            col.update(key, update_data)
+            if 'latitude' in update_data or 'longitude' in update_data:
+                # A partial coordinate edit must reuse the persisted other
+                # component. Otherwise `coordinate` silently remains stale.
+                latitude = update_data.get('latitude', doc.get('latitude'))
+                longitude = update_data.get('longitude', doc.get('longitude'))
+                if latitude is None or longitude is None:
+                    return False
+                update_data['coordinate'] = [float(longitude), float(latitude)]
+
+            # python-arango updates by document handle, not by positional
+            # ``key, patch`` arguments.
+            col.update({"_key": key, **update_data})
+            cached_doc = {**doc, **update_data, "_key": key}
+            self._cache_mosque(cached_doc)
             return True
         except Exception:
             return False
@@ -425,20 +464,42 @@ class ArangoMosqueRepository(MosqueRepository):
 class ArangoDatasetRepository(DatasetRepository):
     def upsert_dataset(self, dataset_id: str, data: Dict[str, Any]) -> None:
         db = get_db()
-        data['_key'] = dataset_id
-        db.collection('datasets').insert(data, overwrite=True)
+        collection = db.collection('datasets')
+        payload = copy.deepcopy(data)
+        # System metadata returned by reads cannot be sent back through an
+        # insert/replace operation.
+        for field in ('_id', '_rev', '_oldRev'):
+            payload.pop(field, None)
+        try:
+            persisted = collection.get(dataset_id) or {}
+            persisted_revision = int(persisted.get('data_revision', 0))
+        except (TypeError, ValueError):
+            persisted_revision = 0
+        try:
+            requested_revision = int(payload.get('data_revision', 0))
+        except (TypeError, ValueError):
+            requested_revision = 0
+        payload['data_revision'] = max(0, persisted_revision, requested_revision)
+        payload['_key'] = dataset_id
+        collection.insert(payload, overwrite=True)
 
     def get_dataset(self, dataset_id: str) -> Optional[Dict[str, Any]]:
         db = get_db()
         try:
-            return db.collection('datasets').get(dataset_id)
+            dataset = db.collection('datasets').get(dataset_id)
+            if dataset:
+                dataset.setdefault('data_revision', 0)
+            return dataset
         except Exception:
             return None
 
     def list_datasets(self) -> List[Dict[str, Any]]:
         db = get_db()
         cursor = db.aql.execute("FOR d IN datasets RETURN d")
-        return [doc for doc in cursor]
+        datasets = [doc for doc in cursor]
+        for dataset in datasets:
+            dataset.setdefault('data_revision', 0)
+        return datasets
 
     def set_active_dataset_id(self, dataset_id: str) -> None:
         db = get_db()

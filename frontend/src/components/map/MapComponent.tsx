@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import { MapContainer, TileLayer, Marker, Popup, Polyline, useMapEvents, useMap } from "react-leaflet";
+import { Circle, MapContainer, TileLayer, Marker, Popup, Polyline, useMapEvents, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 
@@ -111,6 +111,45 @@ function ChangeMapView({ center }: { center: [number, number] | undefined }) {
       }
     }
   }, [center, map]);
+  return null;
+}
+
+function FitSearchRadius({
+  center,
+  radiusKm,
+  enabled,
+  lowDataMode,
+}: {
+  center: [number, number] | undefined;
+  radiusKm: number;
+  enabled: boolean;
+  lowDataMode: boolean;
+}) {
+  const map = useMap();
+  const previousSignature = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!enabled || !center || !Number.isFinite(radiusKm) || radiusKm <= 0) return;
+    const signature = `${center[0].toFixed(5)}:${center[1].toFixed(5)}:${radiusKm.toFixed(2)}`;
+    if (previousSignature.current === signature) return;
+
+    const isMobile = typeof window !== "undefined" && window.innerWidth < 768;
+    const latitudeDelta = radiusKm / 111.32;
+    const longitudeScale = Math.max(Math.cos(center[0] * Math.PI / 180), 0.01);
+    const longitudeDelta = radiusKm / (111.32 * longitudeScale);
+    const radiusBounds = L.latLngBounds(
+      [center[0] - latitudeDelta, center[1] - longitudeDelta],
+      [center[0] + latitudeDelta, center[1] + longitudeDelta]
+    );
+    map.fitBounds(radiusBounds, {
+      paddingTopLeft: isMobile ? [24, 80] : [60, 60],
+      paddingBottomRight: isMobile ? [24, 210] : [60, 60],
+      maxZoom: lowDataMode ? 15 : 16,
+      animate: false,
+    });
+    previousSignature.current = signature;
+  }, [center, enabled, lowDataMode, map, radiusKm]);
+
   return null;
 }
 
@@ -234,14 +273,20 @@ export default function MapComponent({
   zoom = 13,
   markers = [],
   route = null,
+  routeSegments = [],
+  accessConnectors = [],
   routingMode = null,
+  searchRadiusKm = 10,
   onMapClick = undefined
 }: { 
   center?: [number, number],
   zoom?: number,
   markers?: any[],
   route?: [number, number][] | null,
+  routeSegments?: [number, number][][],
+  accessConnectors?: [number, number][][],
   routingMode?: string | null,
+  searchRadiusKm?: number,
   onMapClick?: (e: L.LeafletMouseEvent) => void
 }) {
   const [basemap, setBasemap] = useState("osm");
@@ -254,6 +299,11 @@ export default function MapComponent({
     return Boolean(connection?.saveData || connection?.effectiveType === "2g" || connection?.effectiveType === "slow-2g" || connection?.effectiveType === "3g");
   });
   const effectiveZoom = lowDataMode ? Math.min(zoom, 12) : zoom;
+  const effectiveRouteSegments = routeSegments.length > 0
+    ? routeSegments.filter(segment => segment.length > 0)
+    : route && route.length > 0 ? [route] : [];
+  const routeBounds = effectiveRouteSegments.flat();
+  const hasRoute = routeBounds.length > 0;
 
   const basemaps: Record<string, { url: string, name: string }> = {
     osm: {
@@ -287,6 +337,12 @@ export default function MapComponent({
         markerZoomAnimation={!lowDataMode}
       >
         <ChangeMapView center={center} />
+        <FitSearchRadius
+          center={center}
+          radiusKm={searchRadiusKm}
+          enabled={!hasRoute}
+          lowDataMode={lowDataMode}
+        />
         <TileLayer
           url={basemaps[basemap].url}
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -321,32 +377,61 @@ export default function MapComponent({
           );
         })}
 
-        {route && route.length > 0 && (
+        {!hasRoute && center && searchRadiusKm > 0 && (
+          <Circle
+            center={center}
+            radius={searchRadiusKm * 1000}
+            pathOptions={{
+              color: "#059669",
+              fillColor: "#10b981",
+              fillOpacity: 0.035,
+              opacity: 0.35,
+              weight: 1.5,
+              dashArray: "6 8",
+            }}
+            interactive={false}
+          />
+        )}
+
+        {hasRoute && (
           <>
             {/* Rute Utama */}
-            <Polyline 
-              positions={route} 
-              color={routingMode === "local_approximation" ? "#64748b" : "#2563eb"} 
-              weight={routingMode === "local_approximation" ? 3 : 5} 
-              opacity={0.85} 
-              dashArray={routingMode === "local_approximation" ? "8, 8" : undefined}
-            />
+            {effectiveRouteSegments.map((segment, index) => (
+              <Polyline
+                key={`road-segment-${index}`}
+                positions={segment}
+                color={routingMode === "local_approximation" ? "#64748b" : "#2563eb"}
+                weight={routingMode === "local_approximation" ? 3 : 5}
+                opacity={0.85}
+                dashArray={routingMode === "local_approximation" ? "8, 8" : undefined}
+              />
+            ))}
             
             {/* Konektor Putus-putus untuk Snapping Celah (hanya jika mode jalan raya aktif) */}
-            {routingMode !== "local_approximation" && (() => {
+            {routingMode !== "local_approximation" && accessConnectors.length > 0 && accessConnectors.map((segment, index) => (
+              <Polyline
+                key={`access-connector-${index}`}
+                positions={segment}
+                color="#64748b"
+                weight={2.5}
+                opacity={0.7}
+                dashArray="4, 6"
+              />
+            ))}
+            {routingMode !== "local_approximation" && accessConnectors.length === 0 && (() => {
               const startMarker = markers.find(m => m.type === "start");
               const destMarker = markers.find(m => m.type === "destination");
               const recMosqueMarker = markers.find(m => m.type === "recommended");
               
               const connectors = [];
               
-              if (startMarker && route[0]) {
-                const dist = Math.hypot(startMarker.lat - route[0][0], startMarker.lng - route[0][1]);
+              if (startMarker && routeBounds[0]) {
+                const dist = Math.hypot(startMarker.lat - routeBounds[0][0], startMarker.lng - routeBounds[0][1]);
                 if (dist > 0.0001) {
                   connectors.push(
                     <Polyline 
                       key="start-conn" 
-                      positions={[[startMarker.lat, startMarker.lng], route[0]]} 
+                      positions={[[startMarker.lat, startMarker.lng], routeBounds[0]]}
                       color="#64748b" 
                       weight={2.5} 
                       opacity={0.65} 
@@ -356,13 +441,13 @@ export default function MapComponent({
                 }
               }
               
-              if (destMarker && route[route.length - 1]) {
-                const dist = Math.hypot(destMarker.lat - route[route.length - 1][0], destMarker.lng - route[route.length - 1][1]);
+              if (destMarker && routeBounds[routeBounds.length - 1]) {
+                const dist = Math.hypot(destMarker.lat - routeBounds[routeBounds.length - 1][0], destMarker.lng - routeBounds[routeBounds.length - 1][1]);
                 if (dist > 0.0001) {
                   connectors.push(
                     <Polyline 
                       key="dest-conn" 
-                      positions={[route[route.length - 1], [destMarker.lat, destMarker.lng]]} 
+                      positions={[routeBounds[routeBounds.length - 1], [destMarker.lat, destMarker.lng]]}
                       color="#64748b" 
                       weight={2.5} 
                       opacity={0.65} 
@@ -373,9 +458,9 @@ export default function MapComponent({
               }
               
               if (recMosqueMarker) {
-                let closestPoint = route[0];
+                let closestPoint = routeBounds[0];
                 let minDistance = Infinity;
-                for (const pt of route) {
+                for (const pt of routeBounds) {
                   const dist = Math.hypot(pt[0] - recMosqueMarker.lat, pt[1] - recMosqueMarker.lng);
                   if (dist < minDistance) {
                     minDistance = dist;
@@ -401,14 +486,14 @@ export default function MapComponent({
               return connectors;
             })()}
             
-            <FitBounds bounds={route} lowDataMode={lowDataMode} />
+            <FitBounds bounds={routeBounds} lowDataMode={lowDataMode} />
           </>
         )}
 
         <MapEvents onClick={onMapClick} />
       </MapContainer>
 
-      {tilesLoading && route && route.length > 0 && (
+      {tilesLoading && hasRoute && (
         <div className="pointer-events-none absolute left-1/2 top-4 z-[1000] -translate-x-1/2 rounded-full border border-emerald-200 bg-white/95 px-3 py-1.5 text-[11px] font-semibold text-emerald-800 shadow-lg backdrop-blur dark:border-emerald-900 dark:bg-slate-900/95 dark:text-emerald-300">
           Rute sudah siap · detail peta masih dimuat
         </div>

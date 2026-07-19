@@ -14,9 +14,11 @@ import {
   buildSelectedRouteCacheKey,
   isAbortError,
   isRouteCacheFresh,
+  prewarmRoutingDataset,
   routeToMosque,
   SELECTED_ROUTE_CACHE_TTL_MS,
 } from "@/lib/api";
+import { buildNationalDepartureTime } from "@/lib/prayer-routing";
 
 // Helper function to map facilities to icons/labels
 const getFacilityBadge = (fac: string) => {
@@ -36,11 +38,26 @@ const getFacilityBadge = (fac: string) => {
 };
 
 export default function MosqueDetailDrawer() {
-  const { selectedMosque, setSelectedMosque, startPoint, activeDatasetId, setRouteData, searchSettings, routeCache, setRouteCache } = useAppStore();
+  const { selectedMosque, setSelectedMosque, startPoint, activeDatasetId, setRouteData, searchSettings, routeCache, setRouteCache, setEndPoint } = useAppStore();
   const [isRouting, setIsRouting] = useState(false);
   const routeAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => () => routeAbortRef.current?.abort(), []);
+
+  useEffect(() => {
+    if (!selectedMosque || !startPoint) return;
+    const datasetForRoute = (activeDatasetId === "all" || !activeDatasetId)
+      ? selectedMosque.dataset_id
+      : activeDatasetId;
+    void prewarmRoutingDataset(datasetForRoute || "", {
+      start: startPoint,
+      end: {
+        lat: Number(selectedMosque.latitude),
+        lng: Number(selectedMosque.longitude),
+      },
+      bufferKm: Math.min(parseFloat(searchSettings.bufferKm) || 8, 10),
+    }).catch(() => undefined);
+  }, [activeDatasetId, searchSettings.bufferKm, selectedMosque, startPoint]);
 
   if (!selectedMosque) return null;
 
@@ -76,9 +93,24 @@ export default function MosqueDetailDrawer() {
       // Batasi bufferKm untuk routing (maks 50km)
       const routeBuffer = Math.min(parseFloat(searchSettings.bufferKm) || 10, 50);
       const mosqueId = String(m.id || m.mosque_id || m.name);
-      const routeKey = buildSelectedRouteCacheKey(datasetForRoute, startPoint.lat, startPoint.lng, mosqueId, searchSettings.algorithm);
+      const departureContext = buildNationalDepartureTime(
+        searchSettings.departureMode,
+        searchSettings.currentTime,
+        startPoint.lng,
+      );
+      const costFingerprint = `${searchSettings.fuelPricePerLiter}-${searchSettings.fuelEfficiencyKmPerLiter}-${searchSettings.operatingCostPerKm}-${searchSettings.tollCostPerKm}`;
+      const routeKey = buildSelectedRouteCacheKey(
+        datasetForRoute,
+        startPoint.lat,
+        startPoint.lng,
+        mosqueId,
+        searchSettings.algorithm,
+        costFingerprint,
+        `${departureContext.cacheKey}-${searchSettings.prayer}`,
+      );
       const cached = routeCache?.[routeKey];
       if (isRouteCacheFresh(cached, SELECTED_ROUTE_CACHE_TTL_MS)) {
+        setEndPoint({ lat: m.latitude, lng: m.longitude });
         setRouteData(cached);
         setSelectedMosque(null);
         toast.success(`Rute (${algoLabel}) dimuat dari cache.`);
@@ -92,8 +124,17 @@ export default function MosqueDetailDrawer() {
         searchSettings.algorithm,
         routeBuffer,
         false,
-        controller.signal
+        controller.signal,
+        {
+          fuel_price_per_liter: Number(searchSettings.fuelPricePerLiter),
+          fuel_efficiency_km_per_liter: Number(searchSettings.fuelEfficiencyKmPerLiter),
+          operating_cost_per_km: Number(searchSettings.operatingCostPerKm),
+          toll_cost_per_km: Number(searchSettings.tollCostPerKm),
+        },
+        departureContext.iso,
+        searchSettings.prayer
       );
+      setEndPoint({ lat: m.latitude, lng: m.longitude });
       setRouteData(data);
       setRouteCache(routeKey, data);
       setSelectedMosque(null); // Close drawer on route search success
@@ -124,15 +165,15 @@ export default function MosqueDetailDrawer() {
   };
 
   return (
-    <div className="fixed inset-x-0 bottom-0 md:left-4 md:right-auto md:bottom-4 md:w-[400px] z-50 animate-in slide-in-from-bottom duration-300 pointer-events-auto">
+    <div className="fixed inset-x-0 bottom-0 md:left-4 md:right-auto md:top-4 md:bottom-4 md:w-[440px] z-50 animate-in slide-in-from-bottom duration-300 pointer-events-auto">
       {/* Background glass card */}
-      <div className="bg-white/97 text-slate-900 backdrop-blur-md border border-slate-200/80 rounded-t-3xl md:rounded-3xl shadow-2xl overflow-hidden max-h-[85vh] md:max-h-[700px] flex flex-col">
+      <div className="bg-white/90 dark:bg-slate-900/90 backdrop-blur-xl border border-slate-200/30 dark:border-slate-800/50 rounded-t-3xl md:rounded-3xl shadow-2xl overflow-hidden max-h-[85vh] md:max-h-full md:h-full flex flex-col">
         
         {/* Decorative drag handle for mobile */}
-        <div className="w-12 h-1.5 bg-slate-300 rounded-full mx-auto my-3 md:hidden"></div>
+        <div className="w-12 h-1.5 bg-slate-300 dark:bg-slate-700 rounded-full mx-auto my-3 md:hidden"></div>
 
         {/* Cover image area */}
-        <div className="relative h-44 bg-gradient-to-r from-emerald-800 via-emerald-950 to-teal-900 shrink-0">
+        <div className="relative h-36 md:h-44 bg-gradient-to-r from-emerald-800 via-emerald-950 to-teal-900 dark:from-emerald-900 dark:via-emerald-950 dark:to-teal-950 shrink-0">
           {m.image_url ? (
             <img 
               src={m.image_url} 
@@ -169,7 +210,7 @@ export default function MosqueDetailDrawer() {
         </div>
 
         {/* Scrollable content */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-5 custom-scrollbar">
+        <div className="flex-1 min-h-0 overflow-y-auto p-6 space-y-5 custom-scrollbar">
           {/* Mosque Name & Address */}
           <div>
             <h2 className="text-xl font-black text-slate-800 dark:text-slate-100 tracking-tight leading-tight">{m.name}</h2>
@@ -237,16 +278,16 @@ export default function MosqueDetailDrawer() {
         </div>
 
         {/* Footer Actions */}
-        <div className="p-6 bg-slate-50/90 border-t border-slate-200/70 shrink-0 flex gap-3">
+        <div className="p-6 bg-slate-50/90 dark:bg-slate-900/90 border-t border-slate-200/70 dark:border-slate-800/60 shrink-0 flex gap-3">
           <Button 
             variant="outline" 
-            className="flex-1 bg-white text-slate-700 border-slate-300 hover:bg-slate-100 rounded-xl"
+            className="flex-1 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-750 rounded-xl"
             onClick={() => setSelectedMosque(null)}
           >
             Batal
           </Button>
           <Button 
-            className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold flex items-center justify-center gap-2"
+            className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold flex items-center justify-center gap-2 border dark:border-emerald-700"
             onClick={handleRouteToMosqueAction}
             disabled={isRouting}
           >

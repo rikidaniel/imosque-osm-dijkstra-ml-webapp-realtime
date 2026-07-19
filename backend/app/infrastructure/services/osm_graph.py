@@ -4,13 +4,16 @@ import math
 import os
 import threading
 import gc
+import heapq
 import pickle
 import tempfile
 import time
+import tracemalloc
 from collections import OrderedDict
 from dataclasses import dataclass
+from itertools import count
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
@@ -71,6 +74,7 @@ _graph_prewarm_threads: Dict[str, threading.Thread] = {}
 _edge_index_persist_lock = threading.Lock()
 _edge_index_persist_threads: Dict[str, threading.Thread] = {}
 _graph_runtime_states: Dict[str, Dict[str, Any]] = {}
+_pathfinding_benchmark_lock = threading.Lock()
 _RUNTIME_CACHE_VERSION = 1
 _EDGE_INDEX_CACHE_VERSION = 1
 
@@ -312,7 +316,16 @@ def _compact_graph_for_routing(G):
         current = compact.get_edge_data(u, v)
         if current is not None and float(current.get("travel_time", math.inf)) <= travel_time:
             continue
-        attrs = {"length": length, "travel_time": travel_time}
+        toll_value = data.get("toll", "no")
+        if isinstance(toll_value, (list, tuple, set)):
+            toll_value = next(iter(toll_value), "no")
+        attrs = {
+            "length": length,
+            "travel_time": travel_time,
+            # Retain the OSM toll flag so cost-efficient routing can estimate
+            # monetary toll cost. Older cached graphs simply behave as no-toll.
+            "toll": str(toll_value),
+        }
         if data.get("geometry") is not None:
             attrs["geometry"] = data["geometry"]
         compact.add_edge(u, v, **attrs)
@@ -945,6 +958,7 @@ def warm_road_graph_indexes(G) -> None:
     """Precompute route-critical immutable lookup structures."""
     graph_bounds(G)
     _nearest_edge_index(G)
+    _heuristic_distance_per_weight_unit(G, "travel_time")
 
 
 def prewarm_road_graph(graphml_path: Path = DEFAULT_GRAPHML) -> Dict[str, Any]:
@@ -1106,52 +1120,307 @@ def path_travel_time_s(G, route_nodes: Sequence) -> float:
     return total
 
 
-def dijkstra_path(G, source, target, weight: str = "travel_time"):
-    """Optimized Dijkstra with bidirectional search for 2x speedup."""
-    # Propagate NetworkXNoPath directly. Retrying the same disconnected graph
-    # with single-source Dijkstra only doubles the work before fallback routing.
-    return nx.bidirectional_dijkstra(G, source, target, weight=weight)[1]
+def path_toll_distance_m(G, route_nodes: Sequence) -> float:
+    """Return road distance explicitly marked as tolled in OpenStreetMap."""
+    total = 0.0
+    truthy = {"yes", "true", "1", "designated"}
+    for u, v in zip(route_nodes, route_nodes[1:]):
+        edge_data = G.get_edge_data(u, v)
+        if not edge_data:
+            continue
+        candidates = list(edge_data.values()) if G.is_multigraph() else [edge_data]
+        selected = min(
+            candidates,
+            key=lambda data: float(data.get("travel_time", data.get("length", 0.0) / 8.33)),
+        )
+        toll_value = selected.get("toll", "no")
+        if isinstance(toll_value, (list, tuple, set)):
+            is_toll = any(str(value).strip().lower() in truthy for value in toll_value)
+        else:
+            is_toll = str(toll_value).strip().lower() in truthy
+        if is_toll:
+            total += float(selected.get("length", 0.0))
+    return total
 
 
-def astar_path(G, source, target, weight: str = "travel_time"):
-    """Optimized A* with vectorized heuristic calculation."""
-    # Pre-fetch target coordinates once
-    target_node_data = G.nodes[target]
-    vy = float(target_node_data["y"])
-    vx = float(target_node_data["x"])
-    
-    # Flat earth approximation cos factor based on average latitude
-    source_node_data = G.nodes[source]
-    mid_lat = math.radians((float(source_node_data["y"]) + vy) / 2.0)
-    cos_factor = math.cos(mid_lat)
-    
-    # Pre-compute target in projected coordinates
-    target_py = vy * 111000.0
-    target_px = vx * 111000.0 * cos_factor
-    
-    # Speed factor for travel_time weight
-    # Use a conservative upper speed bound so the heuristic remains admissible
-    # and A* preserves shortest-path correctness on faster road classes.
-    speed_factor = 36.12 if weight == "travel_time" else 1.0  # 130 km/h
-    
-    def heuristic(u, v):
-        """Optimized heuristic with pre-computed values."""
-        node_data = G.nodes[u]
-        uy = float(node_data["y"])
-        ux = float(node_data["x"])
-        
-        # Use pre-projected target coordinates
-        py = uy * 111000.0
-        px = ux * 111000.0 * cos_factor
-        
-        # Fast euclidean distance
-        d_lat = target_py - py
-        d_lon = target_px - px
-        meters = math.sqrt(d_lat * d_lat + d_lon * d_lon)
-        
-        return meters / speed_factor
+def _weight_function(G, weight: str | Callable):
+    """Match NetworkX's public string/callable weight semantics."""
+    if callable(weight):
+        return weight
+    if G.is_multigraph():
+        return lambda _u, _v, data: min(
+            attrs.get(weight, 1) for attrs in data.values()
+        )
+    return lambda _u, _v, data: data.get(weight, 1)
 
-    return nx.astar_path(G, source, target, heuristic=heuristic, weight=weight)
+
+def _node_metric_distance_m(G, u, v) -> float:
+    """Metric distance for geographic graphs, with a projected-graph fallback."""
+    u_data = G.nodes[u]
+    v_data = G.nodes[v]
+    uy, ux = float(u_data["y"]), float(u_data["x"])
+    vy, vx = float(v_data["y"]), float(v_data["x"])
+    if all((-90.0 <= lat <= 90.0) for lat in (uy, vy)) and all(
+        -180.0 <= lon <= 180.0 for lon in (ux, vx)
+    ):
+        return 1000.0 * haversine_km(uy, ux, vy, vx)
+    return math.hypot(vy - uy, vx - ux)
+
+
+def _heuristic_distance_per_weight_unit(G, weight: str | Callable) -> float:
+    """Return a graph-derived scale that makes straight-line A* consistent.
+
+    For every directed edge ``u -> v`` this chooses a scale at least as large
+    as ``metric_distance(u, v) / edge_cost``. The triangle inequality then
+    guarantees ``h(u) <= cost(u, v) + h(v)``. A zero-cost edge that changes
+    position forces a zero heuristic, which remains correct.
+    """
+    if callable(weight):
+        return math.inf
+    cache = getattr(G, "_imosque_heuristic_scales", None)
+    if cache is None:
+        cache = {}
+        G._imosque_heuristic_scales = cache
+    if weight in cache:
+        return cache[weight]
+
+    maximum_ratio = 0.0
+    edge_iter = (
+        G.edges(keys=True, data=True)
+        if G.is_multigraph()
+        else ((u, v, None, data) for u, v, data in G.edges(data=True))
+    )
+    for u, v, _key, data in edge_iter:
+        try:
+            cost = float(data.get(weight, 1))
+        except (AttributeError, TypeError, ValueError):
+            cache[weight] = math.inf
+            return math.inf
+        if not math.isfinite(cost) or cost < 0:
+            cache[weight] = math.inf
+            return math.inf
+        direct_m = _node_metric_distance_m(G, u, v)
+        if cost == 0:
+            if direct_m > 1e-9:
+                cache[weight] = math.inf
+                return math.inf
+            continue
+        maximum_ratio = max(maximum_ratio, direct_m / cost)
+
+    # A tiny floating-point margin protects consistency at equality.
+    scale = maximum_ratio * (1.0 + 1e-12) if maximum_ratio > 0 else math.inf
+    cache[weight] = scale
+    return scale
+
+
+def _astar_heuristic(G, target, weight: str | Callable, stats: Optional[Dict[str, Any]] = None):
+    scale = _heuristic_distance_per_weight_unit(G, weight)
+    if stats is not None:
+        stats["heuristic_scale_m_per_weight_unit"] = None if not math.isfinite(scale) else scale
+        if weight == "travel_time" and math.isfinite(scale):
+            stats["heuristic_upper_speed_kph"] = scale * 3.6
+
+    def heuristic(u, _v):
+        if stats is not None:
+            stats["heuristic_calls"] = stats.get("heuristic_calls", 0) + 1
+        if not math.isfinite(scale) or scale <= 0:
+            return 0.0
+        return _node_metric_distance_m(G, u, target) / scale
+
+    return heuristic
+
+
+def _prepare_search_stats(stats: Dict[str, Any], algorithm: str) -> None:
+    stats.setdefault("algorithm", algorithm)
+    stats["search_calls"] = stats.get("search_calls", 0) + 1
+    stats.setdefault("expanded_nodes", 0)
+    stats.setdefault("expanded_states", 0)
+    stats.setdefault("examined_edges", 0)
+    stats.setdefault("heuristic_calls", 0)
+
+
+def _bidirectional_dijkstra_with_stats(G, source, target, weight, stats: Dict[str, Any]):
+    if source not in G:
+        raise nx.NodeNotFound(f"Source {source} is not in G")
+    if target not in G:
+        raise nx.NodeNotFound(f"Target {target} is not in G")
+    if source == target:
+        return [source]
+
+    weight_fn = _weight_function(G, weight)
+    dists = [{}, {}]
+    paths = [{source: [source]}, {target: [target]}]
+    fringe = [[], []]
+    seen = [{source: 0.0}, {target: 0.0}]
+    serial = count()
+    heapq.heappush(fringe[0], (0.0, next(serial), source))
+    heapq.heappush(fringe[1], (0.0, next(serial), target))
+    neighs = [G._succ, G._pred] if G.is_directed() else [G._adj, G._adj]
+    final_distance = math.inf
+    final_path: List[Any] = []
+    direction = 1
+    expanded_this_call = set()
+
+    while fringe[0] and fringe[1]:
+        direction = 1 - direction
+        distance, _, node = heapq.heappop(fringe[direction])
+        if node in dists[direction]:
+            continue
+        dists[direction][node] = distance
+        stats["expanded_states"] += 1
+        if node not in expanded_this_call:
+            expanded_this_call.add(node)
+            stats["expanded_nodes"] += 1
+        if node in dists[1 - direction]:
+            return final_path
+
+        for neighbor, edge_data in neighs[direction][node].items():
+            stats["examined_edges"] += 1
+            cost = (
+                weight_fn(node, neighbor, edge_data)
+                if direction == 0
+                else weight_fn(neighbor, node, edge_data)
+            )
+            if cost is None:
+                continue
+            candidate = distance + cost
+            if neighbor in dists[direction]:
+                if candidate < dists[direction][neighbor]:
+                    raise ValueError("Contradictory paths found: negative weights?")
+            elif neighbor not in seen[direction] or candidate < seen[direction][neighbor]:
+                seen[direction][neighbor] = candidate
+                heapq.heappush(fringe[direction], (candidate, next(serial), neighbor))
+                paths[direction][neighbor] = paths[direction][node] + [neighbor]
+                if neighbor in seen[0] and neighbor in seen[1]:
+                    total = seen[0][neighbor] + seen[1][neighbor]
+                    if not final_path or total < final_distance:
+                        final_distance = total
+                        reverse_path = list(reversed(paths[1][neighbor]))
+                        final_path = paths[0][neighbor] + reverse_path[1:]
+    raise nx.NetworkXNoPath(f"No path between {source} and {target}.")
+
+
+def _astar_with_stats(G, source, target, heuristic, weight, stats: Dict[str, Any]):
+    if source not in G:
+        raise nx.NodeNotFound(f"Source {source} is not G")
+    if target not in G:
+        raise nx.NodeNotFound(f"Target {target} is not G")
+
+    weight_fn = _weight_function(G, weight)
+    serial = count()
+    queue = [(0.0, next(serial), source, 0.0, None)]
+    enqueued: Dict[Any, Tuple[float, float]] = {}
+    explored: Dict[Any, Any] = {}
+    expanded_this_call = set()
+
+    while queue:
+        _, _, node, distance, parent = heapq.heappop(queue)
+        if node == target:
+            path = [node]
+            while parent is not None:
+                path.append(parent)
+                parent = explored[parent]
+            return list(reversed(path))
+        if node in explored:
+            if explored[node] is None:
+                continue
+            queued_cost, _ = enqueued[node]
+            if queued_cost < distance:
+                continue
+        explored[node] = parent
+        stats["expanded_states"] += 1
+        if node not in expanded_this_call:
+            expanded_this_call.add(node)
+            stats["expanded_nodes"] += 1
+
+        for neighbor, edge_data in G._adj[node].items():
+            stats["examined_edges"] += 1
+            cost = weight_fn(node, neighbor, edge_data)
+            if cost is None:
+                continue
+            candidate = distance + cost
+            if neighbor in enqueued:
+                queued_cost, estimate = enqueued[neighbor]
+                if queued_cost <= candidate:
+                    continue
+            else:
+                estimate = heuristic(neighbor, target)
+            enqueued[neighbor] = candidate, estimate
+            heapq.heappush(
+                queue,
+                (candidate + estimate, next(serial), neighbor, candidate, node),
+            )
+    raise nx.NetworkXNoPath(f"Node {target} not reachable from {source}")
+
+
+def dijkstra_path(
+    G,
+    source,
+    target,
+    weight: str = "travel_time",
+    stats: Optional[Dict[str, Any]] = None,
+):
+    """Optimized bidirectional Dijkstra, optionally with real search counters."""
+    if stats is None:
+        # Propagate NetworkXNoPath directly. Retrying the same disconnected graph
+        # with single-source Dijkstra only doubles the work before fallback routing.
+        return nx.bidirectional_dijkstra(G, source, target, weight=weight)[1]
+    _prepare_search_stats(stats, "dijkstra")
+    return _bidirectional_dijkstra_with_stats(G, source, target, weight, stats)
+
+
+def astar_path(
+    G,
+    source,
+    target,
+    weight: str = "travel_time",
+    stats: Optional[Dict[str, Any]] = None,
+):
+    """A* with a graph-derived, consistent straight-line heuristic."""
+    heuristic = _astar_heuristic(G, target, weight, stats)
+    if stats is None:
+        return nx.astar_path(G, source, target, heuristic=heuristic, weight=weight)
+    _prepare_search_stats(stats, "astar")
+    return _astar_with_stats(G, source, target, heuristic, weight, stats)
+
+
+def benchmark_pathfinding_algorithms(
+    G,
+    source,
+    target,
+    weight: str = "travel_time",
+) -> Dict[str, Dict[str, Any]]:
+    """Benchmark the production Dijkstra and A* searches on the same warm graph."""
+    results: Dict[str, Dict[str, Any]] = {}
+    # Deriving the graph-wide admissibility bound is a one-time graph warmup,
+    # not part of an individual shortest-path search.
+    _heuristic_distance_per_weight_unit(G, weight)
+    with _pathfinding_benchmark_lock:
+        for algorithm, pathfinder in (("dijkstra", dijkstra_path), ("astar", astar_path)):
+            stats: Dict[str, Any] = {}
+            gc.collect()
+            started_tracing = not tracemalloc.is_tracing()
+            if started_tracing:
+                tracemalloc.start()
+            baseline, _ = tracemalloc.get_traced_memory()
+            tracemalloc.reset_peak()
+            started = time.perf_counter()
+            try:
+                path = pathfinder(G, source, target, weight=weight, stats=stats)
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                if started_tracing:
+                    tracemalloc.stop()
+            stats.update(
+                execution_time_ms=round(elapsed_ms, 2),
+                memory_usage_kb=round(max(0, peak - baseline) / 1024.0, 2),
+                route_nodes_count=len(path),
+                route_distance_km=round(path_length_m(G, path) / 1000.0, 3),
+                route_travel_time_seconds=round(path_travel_time_s(G, path), 6),
+            )
+            results[algorithm] = stats
+    return results
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

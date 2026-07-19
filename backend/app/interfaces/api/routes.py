@@ -1,9 +1,13 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, BackgroundTasks, Depends, Header
+from fastapi.responses import JSONResponse
 from typing import Any, Dict, Optional
 import math
 import copy
 import datetime as dt
 import json
+import hmac
+import os
+import logging
 import threading
 import uuid
 from pathlib import Path
@@ -11,19 +15,57 @@ from pathlib import Path
 from app.domain.models.schemas import (
     BuildAllOsmRequest, BuildOsmRequest, BuildOsmRouteRequest, NearestMosquesRequest, RouteRequest, RouteToMosqueRequest,
     MosqueCreateRequest, MosqueUpdateRequest, BulkDeleteRequest, RecommendRouteRequest, BenchmarkRequest,
-    UserSettingsRequest,
+    RealtimeLocationEventRequest, RoutingPrewarmRequest, UserSettingsRequest,
 )
 from app.use_cases.dataset_usecases import DatasetUseCases
 from app.use_cases.routing_usecases import RoutingUseCases
 from app.infrastructure.database.arangodb_repo import ArangoMosqueRepository, ArangoDatasetRepository
+from app.infrastructure.services.routing_worker_client import RoutingWorkerError, RoutingWorkerGateway
+from app.infrastructure.services.routing_osm import attach_prayer_context, build_prayer_routing_context
+from app.infrastructure.services.realtime_events import (
+    RealtimePublisherUnavailable,
+    realtime_event_publisher,
+)
 
 router = APIRouter()
+logger = logging.getLogger("imosque.admin.audit")
+
+
+def _require_admin_access(x_admin_token: str = Header(default="")) -> bool:
+    """Protect destructive maintenance actions when an admin token is configured."""
+    configured_token = os.getenv("IMOSQUE_ADMIN_TOKEN", "").strip()
+    if not configured_token:
+        return False
+    if not hmac.compare_digest(x_admin_token, configured_token):
+        raise HTTPException(
+            status_code=401,
+            detail="Token superadmin tidak valid atau belum diberikan.",
+            headers={"WWW-Authenticate": "AdminToken"},
+        )
+    return True
+
+
+def _audit_admin_action(action: str, *, target: str = "", protected: bool) -> None:
+    token_protected = protected is True
+    logger.info(
+        json.dumps(
+            {
+                "event": "admin_action",
+                "action": action,
+                "target": target,
+                "token_protected": token_protected,
+                "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 mosque_repo = ArangoMosqueRepository()
 dataset_repo = ArangoDatasetRepository()
 
 dataset_usecases = DatasetUseCases(mosque_repo, dataset_repo)
 routing_usecases = RoutingUseCases(mosque_repo, dataset_repo)
+routing_gateway = RoutingWorkerGateway()
 
 _osm_build_all_lock = threading.RLock()
 _osm_graph_download_lock = threading.Lock()
@@ -256,23 +298,70 @@ def _friendly_error(exc: Exception) -> str:
 
 @router.get("/health")
 def health() -> Dict[str, Any]:
-    active = dataset_usecases.get_active_dataset_id()
-    from app.infrastructure.services.osm_graph import get_graphml_path, get_road_graph_status
-    graph_runtime = get_road_graph_status(get_graphml_path(active))
-    return {
-        "status": "healthy",
-        "graph_status": graph_runtime["status"],
-        "graph_ready": graph_runtime["ready"],
-        "graph_runtime": graph_runtime,
-        "version": "4.0.0",
-        "active_dataset_id": active,
-    }
+    from app.infrastructure.database.arangodb_client import check_db_health
+    db_ok, db_err = check_db_health()
+
+    if not db_ok:
+        return {
+            "status": "unhealthy",
+            "database": {
+                "connected": False,
+                "empty": False,
+                "error": db_err
+            },
+            "version": "4.0.0"
+        }
+
+    try:
+        active = dataset_usecases.get_active_dataset_id()
+        from app.infrastructure.services.osm_graph import get_graphml_path, get_road_graph_status
+        graph_runtime = get_road_graph_status(get_graphml_path(active))
+
+        # Cek apakah database kosong (tidak ada dataset sama sekali)
+        datasets = dataset_usecases.list_datasets()
+        db_empty = len(datasets) == 0
+
+        return {
+            "status": "healthy",
+            "database": {
+                "connected": True,
+                "empty": db_empty,
+                "datasets_count": len(datasets)
+            },
+            "graph_status": graph_runtime["status"],
+            "graph_ready": graph_runtime["ready"],
+            "graph_runtime": graph_runtime,
+            "version": "4.0.0",
+            "active_dataset_id": active,
+            "routing_dispatch": routing_gateway.status(),
+            "realtime_ingestion": realtime_event_publisher.status(),
+            "admin_protection_configured": bool(os.getenv("IMOSQUE_ADMIN_TOKEN", "").strip()),
+        }
+    except Exception as exc:
+        return {
+            "status": "unhealthy",
+            "database": {
+                "connected": False,
+                "empty": False,
+                "error": str(exc)
+            },
+            "version": "4.0.0"
+        }
 
 @router.get("/datasets")
 def datasets() -> Dict[str, Any]:
     return {
         "active_dataset_id": dataset_usecases.get_active_dataset_id(),
         "items": dataset_usecases.list_datasets(),
+    }
+
+
+@router.get("/admin/access")
+def admin_access(protected: bool = Depends(_require_admin_access)) -> Dict[str, Any]:
+    return {
+        "status": "authorized",
+        "protection_configured": protected,
+        "mode": "token" if protected else "local_unprotected",
     }
 
 @router.post("/datasets/active")
@@ -365,6 +454,125 @@ def mosques(
     did = dataset_id or dataset_usecases.get_active_dataset_id()
     return dataset_usecases.get_mosques(did, limit, offset, kabko)
 
+
+@router.get("/mosques/search")
+def search_mosques(
+    q: str = Query(..., min_length=2, max_length=120),
+    dataset_id: str = Query("all", max_length=160),
+    limit: int = Query(10, ge=1, le=20),
+    latitude: Optional[float] = Query(None, ge=-90, le=90),
+    longitude: Optional[float] = Query(None, ge=-180, le=180),
+) -> Dict[str, Any]:
+    try:
+        return dataset_usecases.search_mosques(
+            dataset_id,
+            q,
+            limit,
+            latitude,
+            longitude,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=_friendly_error(exc)) from exc
+
+
+def _prewarm_routing_local(req: RoutingPrewarmRequest) -> Dict[str, Any]:
+    if req.dataset_id == "all":
+        raise HTTPException(status_code=400, detail="Prewarm routing memerlukan dataset regional.")
+    coordinates = (req.start_lat, req.start_lon, req.end_lat, req.end_lon)
+    if any(value is not None for value in coordinates) and not all(
+        value is not None for value in coordinates
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Koordinat prewarm harus menyertakan start_lat, start_lon, end_lat, dan end_lon.",
+        )
+
+    corridor = None
+    if all(value is not None for value in coordinates):
+        from app.infrastructure.services.route_graph_cache import (
+            CorridorAreaTooLarge,
+            start_corridor_graph_build,
+        )
+
+        try:
+            corridor = start_corridor_graph_build(
+                req.dataset_id,
+                (
+                    (float(req.start_lat), float(req.start_lon)),
+                    (float(req.end_lat), float(req.end_lon)),
+                ),
+                buffer_km=min(float(req.buffer_km), 10.0),
+            )
+        except CorridorAreaTooLarge as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    from app.infrastructure.services.osm_graph import (
+        get_graphml_path,
+        get_road_graph_status,
+        start_road_graph_prewarm,
+    )
+
+    graph_path = get_graphml_path(req.dataset_id)
+    # A coordinate-aware request warms/builds the small corridor graph. The
+    # province-level graph is only preloaded for legacy callers without points.
+    started = False if corridor is not None else start_road_graph_prewarm(graph_path)
+    mosque_started = routing_usecases.start_mosque_candidate_prewarm(req.dataset_id)
+    return {
+        "status": corridor.get("status") if corridor is not None else (
+            "warming" if started else get_road_graph_status(graph_path).get("status")
+        ),
+        "dataset_id": req.dataset_id,
+        "graph_prewarm_started": started,
+        "mosque_prewarm_started": mosque_started,
+        "graph_runtime": get_road_graph_status(graph_path),
+        "corridor": corridor,
+    }
+
+
+@router.post("/routing/prewarm", status_code=202)
+def prewarm_routing_dataset(
+    dataset_id: str = Query(..., min_length=1, max_length=160),
+    start_lat: Optional[float] = Query(None, ge=-90, le=90),
+    start_lon: Optional[float] = Query(None, ge=-180, le=180),
+    end_lat: Optional[float] = Query(None, ge=-90, le=90),
+    end_lon: Optional[float] = Query(None, ge=-180, le=180),
+    buffer_km: float = Query(8.0, ge=1.0, le=50.0),
+) -> Dict[str, Any]:
+    request = RoutingPrewarmRequest(
+        dataset_id=dataset_id,
+        start_lat=start_lat,
+        start_lon=start_lon,
+        end_lat=end_lat,
+        end_lon=end_lon,
+        buffer_km=buffer_km,
+    )
+    try:
+        return routing_gateway.dispatch(
+            endpoint="internal/v1/routing/prewarm",
+            dataset_id=dataset_id,
+            payload=request.model_dump(),
+            local_call=lambda: _prewarm_routing_local(request),
+        )
+    except RoutingWorkerError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/routing/corridors/{graph_id}")
+def routing_corridor_status(graph_id: str) -> Dict[str, Any]:
+    from app.infrastructure.services.route_graph_cache import corridor_graph_status
+
+    status = corridor_graph_status(graph_id)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Graph koridor tidak ditemukan.")
+    return status
+
+
+@router.get("/routing/corridors")
+def routing_corridors(limit: int = Query(50, ge=1, le=200)) -> Dict[str, Any]:
+    from app.infrastructure.services.route_graph_cache import corridor_cache_summary
+
+    return corridor_cache_summary(limit)
+
 @router.get("/datasets/{dataset_id}/bbox")
 def dataset_bbox(dataset_id: str) -> Dict[str, Any]:
     try:
@@ -408,7 +616,24 @@ def nearest_mosques(req: NearestMosquesRequest) -> Dict[str, Any]:
         did = "all"
     else:
         did = dataset_usecases._slugify(raw_did) if hasattr(dataset_usecases, '_slugify') else raw_did
-    return dataset_usecases.get_nearest_mosques(did, req.latitude, req.longitude, req.radius_km, req.limit)
+    try:
+        return dataset_usecases.get_nearest_mosques(
+            did,
+            req.latitude,
+            req.longitude,
+            req.radius_km,
+            req.limit,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+
+@router.post("/realtime/location", status_code=202)
+def ingest_realtime_location(req: RealtimeLocationEventRequest) -> Dict[str, Any]:
+    try:
+        return realtime_event_publisher.publish_location(req.model_dump())
+    except RealtimePublisherUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.get("/prayer-times")
@@ -443,19 +668,38 @@ def prayer_times(
 def route_selected_mosque(req: RouteToMosqueRequest) -> Dict[str, Any]:
     did = req.dataset_id or dataset_usecases.get_active_dataset_id()
     try:
-        result = routing_usecases.route_to_mosque(
-            req.start_lat, req.start_lon, req.mosque_id,
-            req.algorithm, req.auto_build_osm, req.buffer_km, did
+        prayer_context = build_prayer_routing_context(
+            req.prayer,
+            req.start_lat,
+            req.start_lon,
+            req.departure_time,
         )
+        payload = req.model_dump()
+        payload["dataset_id"] = did
+        result = routing_gateway.dispatch(
+            endpoint="internal/v1/route/to-mosque",
+            dataset_id=did,
+            payload=payload,
+            local_call=lambda: routing_usecases.route_to_mosque(
+                req.start_lat, req.start_lon, req.mosque_id,
+                req.algorithm, req.auto_build_osm, req.buffer_km, did,
+                req.cost_parameters.model_dump(),
+                current_time=prayer_context["departure_time"],
+                prayer_time=prayer_context["target_prayer_time"],
+            ),
+        )
+        attach_prayer_context(result, prayer_context)
         if req.compact_response:
             result.pop("route_geojson", None)
             result["geometry_encoding"] = "google_polyline5"
         return result
+    except RoutingWorkerError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
 @router.post("/osm/build-bbox")
-def build_osm_bbox(req: BuildOsmRequest) -> Dict[str, Any]:
+def build_osm_bbox(req: BuildOsmRequest, protected: bool = Depends(_require_admin_access)) -> Dict[str, Any]:
     if not req.dataset_id:
         raise HTTPException(status_code=400, detail="Pilih dataset tujuan agar graph tidak tersimpan sebagai cache global yang tidak dipakai.")
     profile = dataset_repo.get_dataset(req.dataset_id)
@@ -464,7 +708,9 @@ def build_osm_bbox(req: BuildOsmRequest) -> Dict[str, Any]:
     if not _osm_graph_download_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Build graph lain sedang berjalan. Tunggu hingga selesai atau batalkan antrean massal.")
     try:
-        return routing_usecases.build_osm_bbox(req.north, req.south, req.east, req.west, req.network_type, req.dataset_id)
+        result = routing_usecases.build_osm_bbox(req.north, req.south, req.east, req.west, req.network_type, req.dataset_id)
+        _audit_admin_action("build_osm_bbox", target=str(req.dataset_id), protected=protected)
+        return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_friendly_error(exc))
     finally:
@@ -472,7 +718,7 @@ def build_osm_bbox(req: BuildOsmRequest) -> Dict[str, Any]:
 
 
 @router.post("/osm/build-all")
-def build_all_osm_graphs(req: BuildAllOsmRequest, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+def build_all_osm_graphs(req: BuildAllOsmRequest, background_tasks: BackgroundTasks, protected: bool = Depends(_require_admin_access)) -> Dict[str, Any]:
     with _osm_build_all_lock:
         if _osm_build_all_state["status"] in {"starting", "running", "cancelling"}:
             raise HTTPException(status_code=409, detail="Build graph semua dataset masih berjalan.")
@@ -480,6 +726,7 @@ def build_all_osm_graphs(req: BuildAllOsmRequest, background_tasks: BackgroundTa
         _osm_build_all_state.update(status="starting", cancel_requested=False, job_id=job_id)
         _persist_build_all_state_locked()
     background_tasks.add_task(_run_build_all_graphs, req.network_type, req.force, job_id)
+    _audit_admin_action("build_all_osm_graphs", target=job_id, protected=protected)
     return {"status": "accepted", "job_id": job_id, "message": "Build graph semua dataset dimasukkan ke antrean."}
 
 
@@ -503,13 +750,14 @@ def build_all_osm_status() -> Dict[str, Any]:
 
 
 @router.post("/osm/build-all/cancel")
-def cancel_build_all_osm() -> Dict[str, Any]:
+def cancel_build_all_osm(protected: bool = Depends(_require_admin_access)) -> Dict[str, Any]:
     with _osm_build_all_lock:
         if _osm_build_all_state["status"] not in {"running", "starting"}:
             return {"status": _osm_build_all_state["status"], "message": "Tidak ada build massal yang sedang berjalan."}
         _osm_build_all_state["cancel_requested"] = True
         _osm_build_all_state["status"] = "cancelling"
         _persist_build_all_state_locked()
+    _audit_admin_action("cancel_build_all_osm", protected=protected)
     return {"status": "cancelling", "message": "Build akan dihentikan setelah dataset yang sedang diproses selesai."}
 
 @router.post("/osm/build-route")
@@ -535,12 +783,21 @@ def build_osm_route(req: BuildOsmRouteRequest) -> Dict[str, Any]:
 def route(req: RouteRequest) -> Dict[str, Any]:
     did = req.dataset_id or dataset_usecases.get_active_dataset_id()
     try:
-        result = routing_usecases.route_via_osm_dijkstra(
-            req.start_lat, req.start_lon, req.end_lat, req.end_lon,
-            req.algorithm, req.current_time, req.prayer_time,
-            req.max_candidates, req.auto_build_osm, req.buffer_km, did
+        payload = req.model_dump()
+        payload["dataset_id"] = did
+        result = routing_gateway.dispatch(
+            endpoint="internal/v1/route",
+            dataset_id=did,
+            payload=payload,
+            local_call=lambda: routing_usecases.route_via_osm_dijkstra(
+                req.start_lat, req.start_lon, req.end_lat, req.end_lon,
+                req.algorithm, req.current_time, req.prayer_time,
+                req.max_candidates, req.auto_build_osm, req.buffer_km, did
+            ),
         )
         return result
+    except RoutingWorkerError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
@@ -583,12 +840,13 @@ def delete_mosques_bulk(req: BulkDeleteRequest) -> Dict[str, Any]:
     return {"status": "success", "message": f"{len(req.mosque_ids)} masjid berhasil dihapus."}
 
 @router.delete("/datasets/{dataset_id}")
-def delete_dataset(dataset_id: str) -> Dict[str, Any]:
+def delete_dataset(dataset_id: str, protected: bool = Depends(_require_admin_access)) -> Dict[str, Any]:
     if _graph_build_active():
         raise HTTPException(status_code=409, detail="Dataset tidak dapat dihapus saat build graph berjalan.")
     success = dataset_usecases.delete_dataset(dataset_id)
     if not success:
         raise HTTPException(status_code=404, detail="Dataset tidak ditemukan atau tidak dapat dihapus.")
+    _audit_admin_action("delete_dataset", target=dataset_id, protected=protected)
     return {"status": "success", "message": f"Dataset {dataset_id} berhasil dihapus."}
 
 
@@ -608,114 +866,228 @@ def recommend_route(req: RecommendRouteRequest) -> Dict[str, Any]:
     algo = req.algorithm
     
     try:
-        dep_time = req.departure_time or ""
-        curr_t = dep_time.split("T")[-1][:5] if "T" in dep_time else (dep_time[:5] if dep_time else "17:00")
-        result = routing_usecases.route_via_osm_dijkstra(
-            start_lat=start_lat,
-            start_lon=start_lon,
-            end_lat=end_lat,
-            end_lon=end_lon,
-            algorithm=algo,
-            current_time=curr_t,
-            prayer_time=req.prayer,
-            max_candidates=req.maximum_results,
-            auto_build_osm=req.auto_build_osm,
-            buffer_km=req.search_radius_km,
-            dataset_id=did,
-            profile=req.profile
+        prayer_context = build_prayer_routing_context(
+            req.prayer,
+            start_lat,
+            start_lon,
+            req.departure_time,
         )
+        payload = req.model_dump()
+        payload["dataset_id"] = did
+        result = routing_gateway.dispatch(
+            endpoint="internal/v1/routes/recommend",
+            dataset_id=did,
+            payload=payload,
+            local_call=lambda: routing_usecases.route_via_osm_dijkstra(
+                start_lat=start_lat,
+                start_lon=start_lon,
+                end_lat=end_lat,
+                end_lon=end_lon,
+                algorithm=algo,
+                current_time=prayer_context["departure_time"],
+                prayer_time=prayer_context["target_prayer_time"],
+                max_candidates=req.maximum_results,
+                auto_build_osm=req.auto_build_osm,
+                buffer_km=req.search_radius_km,
+                dataset_id=did,
+                profile=req.profile,
+                cost_parameters=req.cost_parameters.model_dump(),
+            ),
+        )
+        attach_prayer_context(result, prayer_context)
         if req.compact_response:
             result.pop("route_geojson", None)
             result["geometry_encoding"] = "google_polyline5"
         return result
+    except RoutingWorkerError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
 
 @router.post("/routes/benchmark")
-def benchmark_routes(req: BenchmarkRequest) -> Dict[str, Any]:
+def benchmark_routes(req: BenchmarkRequest) -> Any:
     did = req.dataset_id or dataset_usecases.get_active_dataset_id()
-    import time as time_mod
-    
-    dep_time = req.departure_time or ""
-    curr_t = dep_time.split("T")[-1][:5] if "T" in dep_time else (dep_time[:5] if dep_time else "17:00")
-    
-    # Run Dijkstra
-    start_time_dijkstra = time_mod.perf_counter()
     try:
-        res_dijkstra = routing_usecases.route_via_osm_dijkstra(
-            start_lat=req.origin.latitude,
-            start_lon=req.origin.longitude,
-            end_lat=req.destination.latitude,
-            end_lon=req.destination.longitude,
-            algorithm="dijkstra",
-            current_time=curr_t,
-            prayer_time=req.prayer,
-            max_candidates=3,
-            auto_build_osm=True,
-            buffer_km=req.search_radius_km,
-            dataset_id=did
+        from app.infrastructure.services.osm_graph import (
+            benchmark_pathfinding_algorithms,
+            get_graphml_path,
+            get_road_graph_status,
+            graph_covers_points,
+            load_road_graph,
+            nearest_road_nodes_batch,
+            start_road_graph_prewarm,
         )
-        elapsed_dijkstra = (time_mod.perf_counter() - start_time_dijkstra) * 1000
-    except Exception as exc:
-        res_dijkstra = {"error": str(exc)}
-        elapsed_dijkstra = 0.0
-
-    # Run A*
-    start_time_astar = time_mod.perf_counter()
-    try:
-        res_astar = routing_usecases.route_via_osm_dijkstra(
-            start_lat=req.origin.latitude,
-            start_lon=req.origin.longitude,
-            end_lat=req.destination.latitude,
-            end_lon=req.destination.longitude,
-            algorithm="astar",
-            current_time=curr_t,
-            prayer_time=req.prayer,
-            max_candidates=3,
-            auto_build_osm=True,
-            buffer_km=req.search_radius_km,
-            dataset_id=did
+        from app.infrastructure.services.route_graph_cache import (
+            CorridorAreaTooLarge,
+            find_covering_corridor_graph,
+            metadata_covers_points,
+            start_corridor_graph_build,
         )
-        elapsed_astar = (time_mod.perf_counter() - start_time_astar) * 1000
-    except Exception as exc:
-        res_astar = {"error": str(exc)}
-        elapsed_astar = 0.0
 
-    dijkstra_nodes = res_dijkstra.get("route_summary", {}).get("route_nodes_count", 0) if "error" not in res_dijkstra else 0
-    astar_nodes = res_astar.get("route_summary", {}).get("route_nodes_count", 0) if "error" not in res_astar else 0
-    
-    dijkstra_dist = res_dijkstra.get("route_summary", {}).get("distance_km", 0.0) if "error" not in res_dijkstra else 0.0
-    astar_dist = res_astar.get("route_summary", {}).get("distance_km", 0.0) if "error" not in res_astar else 0.0
+        origin = (float(req.origin.latitude), float(req.origin.longitude))
+        destination = (float(req.destination.latitude), float(req.destination.longitude))
+        points = (origin, destination)
+        graph_path = find_covering_corridor_graph(did, points)
+        graph_scope = "route_corridor"
 
-    dijkstra_explored_estimate = int(dijkstra_nodes * 4.5) if dijkstra_nodes > 0 else 0
-    astar_explored_estimate = int(astar_nodes * 1.8) if astar_nodes > 0 else 0
+        base_graph_path = get_graphml_path(did)
+        try:
+            base_metadata = dataset_repo.get_osm_cache(did)
+        except Exception:
+            base_metadata = None
+        if graph_path is None and base_graph_path.exists() and (
+            not base_metadata or metadata_covers_points(base_metadata, points)
+        ):
+            graph_path = base_graph_path
+            graph_scope = str((base_metadata or {}).get("build_scope", "dataset_graph"))
 
-    return {
-        "status": "success",
-        "benchmark": {
-            "dijkstra": {
-                "algorithm": "Dijkstra",
-                "execution_time_ms": round(elapsed_dijkstra, 2) or res_dijkstra.get("execution_time_ms", 120.0),
-                "explored_nodes": dijkstra_explored_estimate,
-                "route_distance_km": dijkstra_dist,
-                "memory_usage_kb": 2450.0,
+        if graph_path is None:
+            try:
+                corridor = start_corridor_graph_build(
+                    did,
+                    points,
+                    buffer_km=min(float(req.search_radius_km), 10.0),
+                )
+            except CorridorAreaTooLarge as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if corridor.get("status") == "error":
+                raise HTTPException(
+                    status_code=503,
+                    detail=corridor.get("error") or "Pembangunan graph koridor gagal.",
+                )
+            if not corridor.get("ready"):
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "status": "preparing_graph",
+                        "message": "Menyiapkan graph jalan lokal untuk wilayah rute. Benchmark akan dilanjutkan otomatis.",
+                        "corridor": corridor,
+                        "status_url": f"/api/v1/routing/corridors/{corridor.get('graph_id')}",
+                        "retry_after_ms": int(corridor.get("retry_after_ms", 1500)),
+                    },
+                )
+            graph_path = Path(str(corridor["graphml_path"]))
+
+        graph_runtime = get_road_graph_status(graph_path)
+        if graph_scope == "route_corridor" and not graph_runtime.get("ready"):
+            prewarm_started = start_road_graph_prewarm(graph_path)
+            graph_id = graph_path.stem.removeprefix("road_graph_corridor_")
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "preparing_graph",
+                    "message": "Memuat graph koridor dan indeks jalan ke memori.",
+                    "corridor": {
+                        "graph_id": graph_id,
+                        "status": "loading",
+                        "ready": False,
+                        "prewarm_started": prewarm_started,
+                    },
+                    "status_url": f"/api/v1/routing/corridors/{graph_id}",
+                    "retry_after_ms": 1000,
+                },
+            )
+
+        graph = load_road_graph(graph_path)
+        if not graph_covers_points(graph, [origin, destination], margin_km=0.5):
+            corridor = start_corridor_graph_build(
+                did,
+                points,
+                buffer_km=min(float(req.search_radius_km), 10.0),
+            )
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "preparing_graph",
+                    "message": "Graph lama tidak mencakup titik rute; graph koridor baru sedang disiapkan.",
+                    "corridor": corridor,
+                    "status_url": f"/api/v1/routing/corridors/{corridor.get('graph_id')}",
+                    "retry_after_ms": int(corridor.get("retry_after_ms", 1500)),
+                },
+            )
+        source, target = nearest_road_nodes_batch(graph, [origin, destination])
+        if source == target:
+            raise HTTPException(
+                status_code=422,
+                detail="Titik awal dan tujuan tersambung ke node jalan yang sama; pilih titik yang lebih berjauhan.",
+            )
+
+        measured = benchmark_pathfinding_algorithms(
+            graph,
+            source,
+            target,
+            weight="travel_time",
+        )
+        dijkstra = measured["dijkstra"]
+        astar = measured["astar"]
+        dijkstra_ms = float(dijkstra["execution_time_ms"])
+        astar_ms = float(astar["execution_time_ms"])
+        faster_algorithm = (
+            "Sama"
+            if astar_ms == dijkstra_ms
+            else ("A*" if astar_ms < dijkstra_ms else "Dijkstra")
+        )
+        slower_ms = max(dijkstra_ms, astar_ms)
+        time_difference_ms = abs(dijkstra_ms - astar_ms)
+        dijkstra_nodes = int(dijkstra["expanded_nodes"])
+        astar_nodes = int(astar["expanded_nodes"])
+        fewer_nodes_algorithm = (
+            "Sama"
+            if astar_nodes == dijkstra_nodes
+            else ("A*" if astar_nodes < dijkstra_nodes else "Dijkstra")
+        )
+        optimal_cost_match = math.isclose(
+            float(dijkstra["route_travel_time_seconds"]),
+            float(astar["route_travel_time_seconds"]),
+            rel_tol=1e-9,
+            abs_tol=1e-7,
+        )
+        if not optimal_cost_match:
+            raise RuntimeError("Audit optimalitas gagal: biaya A* berbeda dari Dijkstra.")
+
+        return {
+            "status": "success",
+            "benchmark": {
+                "dijkstra": {
+                    **dijkstra,
+                    "algorithm": "Dijkstra (Bidirectional)",
+                    "explored_nodes": dijkstra_nodes,
+                },
+                "astar": {
+                    **astar,
+                    "algorithm": "A* (Heuristik Konsisten)",
+                    "explored_nodes": astar_nodes,
+                },
+                "comparison": {
+                    "faster_algorithm": faster_algorithm,
+                    "time_difference_ms": round(time_difference_ms, 2),
+                    "efficiency_gain_percent": round(
+                        (time_difference_ms / slower_ms) * 100.0 if slower_ms > 0 else 0.0,
+                        1,
+                    ),
+                    "fewer_explored_algorithm": fewer_nodes_algorithm,
+                    "explored_nodes_difference": abs(dijkstra_nodes - astar_nodes),
+                    "nodes_saved": max(0, dijkstra_nodes - astar_nodes),
+                    "optimal_cost_match": True,
+                },
+                "measurement": {
+                    "scope": "shortest_path_only",
+                    "weight": "travel_time_seconds",
+                    "graph_warm": True,
+                    "cache_used": graph_scope == "route_corridor",
+                    "graph_scope": graph_scope,
+                    "graph_path": str(graph_path),
+                    "source_node": str(source),
+                    "target_node": str(target),
+                },
+                "graph_runtime": get_road_graph_status(graph_path),
             },
-            "astar": {
-                "algorithm": "A*",
-                "execution_time_ms": round(elapsed_astar, 2) or res_astar.get("execution_time_ms", 75.0),
-                "explored_nodes": astar_explored_estimate,
-                "route_distance_km": astar_dist,
-                "memory_usage_kb": 1820.0,
-            },
-            "comparison": {
-                "faster_algorithm": "A*" if elapsed_astar < elapsed_dijkstra else "Dijkstra",
-                "time_difference_ms": round(abs(elapsed_dijkstra - elapsed_astar), 2),
-                "nodes_saved": max(0, dijkstra_explored_estimate - astar_explored_estimate),
-                "efficiency_gain_percent": round((1.0 - (elapsed_astar / elapsed_dijkstra if elapsed_dijkstra > 0 else 0.5)) * 100, 1)
-            }
         }
-    }
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise exc
+        raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
 
 @router.get("/routes/{route_id}")
@@ -740,49 +1112,31 @@ def get_route_by_id(route_id: str) -> Dict[str, Any]:
 
 @router.get("/routing-profiles")
 def get_routing_profiles() -> Dict[str, Any]:
+    from app.infrastructure.services.routing_osm import (
+        DEFAULT_TRAVEL_COST_PARAMETERS,
+        MULTI_OBJECTIVE_PROFILE_WEIGHTS,
+    )
+
     return {
         "profiles": [
             {
-                "name": "fastest",
-                "label": "Fastest (Waktu Tercepat)",
-                "weights": {
-                    "travel_time": 0.60,
-                    "prayer_penalty": 0.25,
-                    "distance": 0.10,
-                    "cost": 0.05
-                }
-            },
-            {
-                "name": "prayer_priority",
-                "label": "Prayer Priority (Prioritas Salat)",
-                "weights": {
-                    "prayer_penalty": 0.50,
-                    "travel_time": 0.30,
-                    "distance": 0.10,
-                    "cost": 0.10
-                }
-            },
-            {
-                "name": "low_cost",
-                "label": "Low Cost (Biaya Terendah)",
-                "weights": {
-                    "cost": 0.45,
-                    "distance": 0.25,
-                    "travel_time": 0.20,
-                    "prayer_penalty": 0.10
-                }
-            },
-            {
-                "name": "balanced",
-                "label": "Balanced (Seimbang)",
-                "weights": {
-                    "travel_time": 0.30,
-                    "distance": 0.30,
-                    "prayer_penalty": 0.20,
-                    "cost": 0.20
-                }
+                "name": name,
+                "label": {
+                    "fastest": "Fastest (Waktu Tercepat)",
+                    "prayer_priority": "Prayer Priority (Prioritas Salat)",
+                    "low_cost": "Low Cost (Biaya Rupiah Terendah)",
+                    "balanced": "Balanced (Seimbang)",
+                }[name],
+                "weights": weights,
             }
-        ]
+            for name, weights in MULTI_OBJECTIVE_PROFILE_WEIGHTS.items()
+        ],
+        "cost_model": {
+            "currency": "IDR",
+            "formula": "fuel + vehicle_operation + toll",
+            "default_parameters": DEFAULT_TRAVEL_COST_PARAMETERS,
+            "note": "Parameter dapat dioverride melalui cost_parameters pada POST /routes/recommend.",
+        },
     }
 
 

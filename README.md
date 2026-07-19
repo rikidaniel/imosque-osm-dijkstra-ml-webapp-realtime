@@ -132,6 +132,11 @@ Hasil benchmark lokal tanggal 16 Juli 2026:
 
 Angka tersebut adalah benchmark HTTP lokal dengan database dan graph sudah tersedia, bukan SLA produksi. Pada 3G, round-trip jaringan dan tile peta biasanya lebih dominan daripada payload JSON API 1–2 KB. Uji 25/50/100 pengguna, p95/p99 end-to-end, RAM per worker, dan kondisi server produksi tetap diperlukan sebelum scale-out.
 
+Evaluasi algoritma reproducible pada graph DKI (196.565 node, 456.186 edge) juga
+tersedia di [`docs/evaluation.md`](docs/evaluation.md). Pada 20 pasangan OD,
+Dijkstra dan A* cocok optimal 100%; Dijkstra median 328,87 ms dan A* median
+548,95 ms. Data mentah JSON/CSV disimpan di `docs/evaluation-results/`.
+
 ## Teknologi
 
 | Bagian | Teknologi |
@@ -277,6 +282,14 @@ Backend membaca environment variable berikut:
 | `IMOSQUE_EDGE_SNAP_CACHE_SIZE` | `20000` | Batas hasil proyeksi koordinat-ke-edge per graph; `0` menonaktifkan cache |
 | `IMOSQUE_MOSQUE_CACHE_DATASETS` | `2` | Jumlah snapshot kandidat masjid berbasis revisi yang disimpan di memori |
 | `IMOSQUE_MOSQUE_CACHE_MAX_ROWS` | `25000` | Batas ukuran dataset yang boleh dipanaskan sebagai snapshot kandidat; `0` menonaktifkan |
+| `IMOSQUE_ROUTING_WORKER_URL` | kosong | URL routing worker default; kosong memakai routing lokal |
+| `IMOSQUE_ROUTING_WORKER_MAP` | kosong | Objek JSON mapping dataset/prefix `*` ke worker regional |
+| `IMOSQUE_ROUTING_INTERNAL_TOKEN` | kosong | Token antar-API dan routing worker |
+| `IMOSQUE_ROUTING_REMOTE_FALLBACK` | `true` | Fallback lokal bila worker gagal; gunakan `false` pada API stateless produksi |
+| `IMOSQUE_KAFKA_BOOTSTRAP_SERVERS` | kosong | Broker Kafka; kosong menonaktifkan ingestion realtime |
+| `IMOSQUE_KAFKA_LOCATION_TOPIC` | `imosque.location.v1` | Topic event lokasi |
+| `IMOSQUE_EVENT_PSEUDONYM_SECRET` | kosong | Kunci HMAC untuk pseudonimisasi ID event; wajib di production |
+| `IMOSQUE_ADMIN_TOKEN` | kosong | Token backend untuk tindakan superadmin: build graph manual, prewarm massal, pembatalan build, dan hapus dataset. Wajib pada stack nasional; tindakan dicatat sebagai audit log terstruktur. |
 
 Contoh PowerShell sebelum menjalankan backend:
 
@@ -393,7 +406,11 @@ Semua endpoint menggunakan base URL `http://127.0.0.1:8000/api/v1`. Tidak ada au
 | PUT | `/mosques/{dataset_id}/{mosque_id}` | Ubah masjid |
 | DELETE | `/mosques/{dataset_id}/{mosque_id}` | Hapus masjid |
 | POST | `/mosques/bulk-delete` | Hapus banyak masjid |
+| GET | `/mosques/search` | Cari masjid terindeks di seluruh database |
 | POST | `/nearest-mosques` | Cari masjid terdekat |
+| POST | `/routing/prewarm` | Muat graph wilayah secara asinkron sebelum routing |
+| GET | `/routing/corridors/{graph_id}` | Status build graph koridor regional |
+| POST | `/realtime/location` | Antrekan event lokasi ke Kafka |
 | GET | `/prayer-times` | Hitung waktu salat offline |
 | POST | `/route` | Routing kompatibilitas/level rendah |
 | POST | `/route/to-mosque` | Rute ke masjid tertentu |
@@ -564,3 +581,4 @@ Bangun graph melalui `/osm/build-bbox` atau `/osm/build-all`. `auto_build_osm: t
 - [Evaluasi](docs/evaluation.md)
 - [PRD](docs/prd.md)
 - [Fitur user settings](FITUR_USER_SETTINGS.md)
+- [Rencana eksekusi skala nasional](docs/national-scale-execution-plan.md)

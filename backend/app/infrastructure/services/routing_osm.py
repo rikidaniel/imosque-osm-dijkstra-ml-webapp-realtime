@@ -9,6 +9,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 import re
 import networkx as nx
@@ -44,6 +45,8 @@ from .osm_graph import (
 
 Coordinate = Tuple[float, float]
 OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving"
+OSRM_CONNECT_TIMEOUT_SECONDS = 1.5
+OSRM_READ_TIMEOUT_SECONDS = 4.5
 MAX_INLINE_AUTO_BUILD_AREA_KM2 = 90.0
 ROUTE_CACHE_TTL_SECONDS = 24 * 60 * 60
 ROUTE_CACHE_MAX_ENTRIES = 256
@@ -69,6 +72,181 @@ def _parse_hhmm(value: Optional[str]) -> Optional[dt.datetime]:
         return dt.datetime.combine(today, t)
     except Exception:
         return None
+
+
+_PRAYER_NAME_ALIASES = {
+    "fajr": "fajr",
+    "subuh": "fajr",
+    "dhuhr": "dhuhr",
+    "dzuhur": "dhuhr",
+    "asr": "asr",
+    "ashar": "asr",
+    "maghrib": "maghrib",
+    "isha": "isha",
+    "isya": "isha",
+}
+_PRAYER_LABELS = {
+    "fajr": "Subuh",
+    "dhuhr": "Dzuhur",
+    "asr": "Ashar",
+    "maghrib": "Maghrib",
+    "isha": "Isya",
+}
+_PRAYER_ORDER = ("fajr", "dhuhr", "asr", "maghrib", "isha")
+
+
+def indonesia_timezone_for_longitude(lon: float) -> Tuple[str, str, int]:
+    """Return the Indonesian civil timezone used by the routing origin."""
+    longitude = float(lon)
+    if longitude >= 126.0:
+        return "Asia/Jayapura", "WIT", 9
+    if longitude >= 110.0:
+        return "Asia/Makassar", "WITA", 8
+    return "Asia/Jakarta", "WIB", 7
+
+
+def _departure_datetime(departure_time: Optional[str], lon: float) -> dt.datetime:
+    timezone_name, _, _ = indonesia_timezone_for_longitude(lon)
+    timezone = ZoneInfo(timezone_name)
+    value = str(departure_time or "").strip()
+    if not value:
+        return dt.datetime.now(timezone).replace(second=0, microsecond=0)
+
+    if re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", value):
+        parsed_time = dt.datetime.strptime(value, "%H:%M").time()
+        return dt.datetime.combine(dt.datetime.now(timezone).date(), parsed_time, timezone)
+
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return dt.datetime.now(timezone).replace(second=0, microsecond=0)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone, second=0, microsecond=0)
+    return parsed.astimezone(timezone).replace(second=0, microsecond=0)
+
+
+def build_prayer_routing_context(
+    prayer: Optional[str],
+    lat: float,
+    lon: float,
+    departure_time: Optional[str],
+) -> Dict[str, Any]:
+    """Resolve departure and target prayer using the origin's national timezone."""
+    from app.infrastructure.services.prayer_time import calculate_offline_prayer_times
+
+    departure = _departure_datetime(departure_time, lon)
+    timezone_name, timezone_abbreviation, utc_offset_hours = indonesia_timezone_for_longitude(lon)
+    requested = str(prayer or "auto").strip().lower()
+    normalized = _PRAYER_NAME_ALIASES.get(requested)
+    automatic = requested in {"", "auto", "next", "berikutnya"} or normalized is None
+
+    def schedule_for(day: dt.date) -> Dict[str, str]:
+        return calculate_offline_prayer_times(float(lat), float(lon), day)
+
+    departure_minutes = departure.hour * 60 + departure.minute
+    target_day = departure.date()
+    target_name = normalized
+    schedule = schedule_for(target_day)
+
+    if automatic:
+        target_name = None
+        for name in _PRAYER_ORDER:
+            hour, minute = (int(part) for part in schedule[name].split(":"))
+            if hour * 60 + minute >= departure_minutes:
+                target_name = name
+                break
+        if target_name is None:
+            target_day += dt.timedelta(days=1)
+            schedule = schedule_for(target_day)
+            target_name = "fajr"
+    else:
+        assert target_name is not None
+        hour, minute = (int(part) for part in schedule[target_name].split(":"))
+        if hour * 60 + minute < departure_minutes:
+            target_day += dt.timedelta(days=1)
+            schedule = schedule_for(target_day)
+
+    target_time = schedule[target_name]
+    target_hour, target_minute = (int(part) for part in target_time.split(":"))
+    target_datetime = dt.datetime.combine(
+        target_day,
+        dt.time(target_hour, target_minute),
+        ZoneInfo(timezone_name),
+    )
+    offset = f"{utc_offset_hours:+03d}:00"
+    return {
+        "requested_prayer": requested or "auto",
+        "automatic_target": automatic,
+        "target_prayer": target_name,
+        "target_prayer_label": _PRAYER_LABELS[target_name],
+        "target_prayer_time": target_time,
+        "target_prayer_date": target_day.isoformat(),
+        "target_day_offset": (target_day - departure.date()).days,
+        "departure_date": departure.date().isoformat(),
+        "departure_time": departure.strftime("%H:%M"),
+        "departure_local_iso": departure.isoformat(),
+        "target_local_iso": target_datetime.isoformat(),
+        "timezone": timezone_name,
+        "timezone_abbreviation": timezone_abbreviation,
+        "utc_offset": offset,
+        "calculation_source": "offline_kemenag_calculation",
+    }
+
+
+def attach_prayer_context(result: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach transparent departure, arrival, and adhan clocks to a route result."""
+    enriched = dict(context)
+    try:
+        departure = dt.datetime.fromisoformat(str(context["departure_local_iso"]))
+        minutes = float(result.get("route_summary", {}).get("arrival_to_mosque_minutes"))
+        arrival = departure + dt.timedelta(minutes=minutes)
+        enriched["arrival_date"] = arrival.date().isoformat()
+        enriched["arrival_time"] = arrival.strftime("%H:%M")
+        enriched["arrival_local_iso"] = arrival.isoformat()
+    except (KeyError, TypeError, ValueError):
+        enriched["arrival_date"] = None
+        enriched["arrival_time"] = None
+        enriched["arrival_local_iso"] = None
+    result["prayer_context"] = enriched
+    return result
+
+
+def _resolve_prayer_time_string(prayer_time: Optional[str], lat: float, lon: float) -> Optional[str]:
+    if not prayer_time:
+        return None
+
+    prayer_time_lower = prayer_time.lower()
+
+    if re.match(r"^\d{2}:\d{2}$", prayer_time_lower):
+        return prayer_time_lower
+
+    if prayer_time_lower == "auto":
+        return build_prayer_routing_context("auto", lat, lon, None)["target_prayer_time"]
+
+    if prayer_time_lower in _PRAYER_NAME_ALIASES:
+        resolved_name = prayer_time_lower
+        api_name = _PRAYER_NAME_ALIASES[resolved_name]
+        from app.infrastructure.services.prayer_time import calculate_offline_prayer_times
+        import datetime as dt_module
+        try:
+            timings = calculate_offline_prayer_times(float(lat), float(lon), dt_module.date.today())
+            raw_time = timings.get(api_name)
+            if raw_time:
+                match = re.search(r"\d{2}:\d{2}", raw_time)
+                return match.group(0) if match else raw_time
+        except Exception:
+            pass
+
+        fallback_map = {
+            "fajr": "04:45",
+            "dhuhr": "12:00",
+            "asr": "15:15",
+            "maghrib": "18:00",
+            "isha": "19:15"
+        }
+        return fallback_map.get(api_name, "18:00")
+
+    return None
 
 
 def _distance_point_to_segment_km(p: Coordinate, a: Coordinate, b: Coordinate) -> float:
@@ -782,6 +960,73 @@ def _normalise_values(values: List[float]) -> List[float]:
     return [(v - lo) / (hi - lo) for v in values]
 
 
+def estimate_travel_cost(
+    distance_km: float,
+    toll_distance_km: float = 0.0,
+    cost_parameters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, float]:
+    parameters = {
+        "fuel_price_per_liter": 10_000.0,
+        "fuel_efficiency_km_per_liter": 12.0,
+        "operating_cost_per_km": 300.0,
+        "toll_cost_per_km": 1_000.0,
+        **(cost_parameters or {}),
+    }
+    distance = max(0.0, float(distance_km))
+    toll_distance = max(0.0, min(distance, float(toll_distance_km)))
+    efficiency = max(0.1, float(parameters["fuel_efficiency_km_per_liter"]))
+    fuel_liters = distance / efficiency
+    fuel_cost = fuel_liters * max(0.0, float(parameters["fuel_price_per_liter"]))
+    operating_cost = distance * max(0.0, float(parameters["operating_cost_per_km"]))
+    toll_cost = toll_distance * max(0.0, float(parameters["toll_cost_per_km"]))
+    total = fuel_cost + operating_cost + toll_cost
+    return {
+        "fuel_liters": round(fuel_liters, 3),
+        "fuel_cost_rupiah": round(fuel_cost, 2),
+        "operating_cost_rupiah": round(operating_cost, 2),
+        "toll_cost_rupiah": round(toll_cost, 2),
+        "estimated_cost_rupiah": round(total, 2),
+    }
+
+
+def apply_multi_objective_scores(
+    results: List[Dict[str, Any]],
+    profile: str,
+    cost_parameters: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not results:
+        return
+    weights = {
+        "fastest": {"time": 0.70, "cost": 0.10, "prayer": 0.10, "capacity": 0.05, "priority": 0.05},
+        "prayer_priority": {"time": 0.20, "cost": 0.10, "prayer": 0.60, "capacity": 0.05, "priority": 0.05},
+        "low_cost": {"time": 0.20, "cost": 0.60, "prayer": 0.10, "capacity": 0.05, "priority": 0.05},
+        "balanced": {"time": 0.40, "cost": 0.20, "prayer": 0.20, "capacity": 0.10, "priority": 0.10},
+    }
+    selected_weights = weights.get(str(profile).lower(), weights["balanced"])
+    for result in results:
+        breakdown = estimate_travel_cost(
+            result.get("distance_km", 0.0),
+            result.get("toll_distance_km", 0.0),
+            cost_parameters,
+        )
+        result["cost_breakdown"] = breakdown
+        result["estimated_cost_rupiah"] = breakdown["estimated_cost_rupiah"]
+
+    time_normalized = _normalise_values([float(result.get("estimated_time_minutes", 0.0)) for result in results])
+    cost_normalized = _normalise_values([float(result["estimated_cost_rupiah"]) for result in results])
+    for index, result in enumerate(results):
+        capacity_penalty = 1.0 - float(result.get("capacity_score", 0.5))
+        priority_penalty = 1.0 - float(result.get("priority_score", 0.5))
+        result["multi_objective_score"] = round(
+            selected_weights["time"] * time_normalized[index]
+            + selected_weights["cost"] * cost_normalized[index]
+            + selected_weights["prayer"] * float(result.get("prayer_penalty", 0.3))
+            + selected_weights["capacity"] * capacity_penalty
+            + selected_weights["priority"] * priority_penalty,
+            4,
+        )
+
+
 def _inline_auto_build_skip_note(points: Sequence[Coordinate], buffer_km: float) -> Optional[str]:
     north, south, east, west = bbox_from_points(points, buffer_km=buffer_km)
     area_km2 = bbox_area_km2(north, south, east, west)
@@ -979,6 +1224,8 @@ def _format_route_response(
             "arrival_status": best.get("arrival_status", "unknown"),
             "minutes_before_prayer": best.get("minutes_before_prayer", 0.0),
             "multi_objective_score": best["multi_objective_score"],
+            "estimated_cost_rupiah": best.get("estimated_cost_rupiah", 0.0),
+            "cost_breakdown": best.get("cost_breakdown", {}),
             "route_nodes_count": best["route_nodes_count"],
             "geometry_points_count": sum(len(segment) for segment in simplified_segments),
             "geometry_original_points_count": sum(len(segment) for segment in raw_segments),
@@ -1008,6 +1255,7 @@ def _format_route_response(
                 "arrival_status": r.get("arrival_status", "unknown"),
                 "minutes_before_prayer": r.get("minutes_before_prayer", 0.0),
                 "multi_objective_score": r["multi_objective_score"],
+                "estimated_cost_rupiah": r.get("estimated_cost_rupiah", 0.0),
             }
             for r in results[:requested_candidates]
         ],
@@ -1032,6 +1280,7 @@ def _route_via_local_approximation(
     end_lon: float,
     fallback_note: str,
     profile: str = "balanced",
+    cost_parameters: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     start_clock = time.perf_counter()
     results: List[Dict[str, Any]] = []
@@ -1067,37 +1316,7 @@ def _route_via_local_approximation(
     if not results:
         raise RuntimeError("Tidak ada kandidat masjid lokal yang dapat dievaluasi.")
 
-    # Dynamic weighting based on profile
-    weights = {
-        "fastest": {
-            "time": 0.70, "dist": 0.10, "prayer": 0.10, "capacity": 0.05, "priority": 0.05
-        },
-        "prayer_priority": {
-            "time": 0.20, "dist": 0.10, "prayer": 0.60, "capacity": 0.05, "priority": 0.05
-        },
-        "low_cost": {
-            "time": 0.20, "dist": 0.60, "prayer": 0.10, "capacity": 0.05, "priority": 0.05
-        },
-        "balanced": {
-            "time": 0.40, "dist": 0.20, "prayer": 0.20, "capacity": 0.10, "priority": 0.10
-        }
-    }
-    
-    prof_weights = weights.get(profile.lower(), weights["balanced"])
-
-    time_norm = _normalise_values([r["estimated_time_minutes"] for r in results])
-    dist_norm = _normalise_values([r["distance_km"] for r in results])
-    for i, r in enumerate(results):
-        capacity_penalty = 1.0 - r["capacity_score"]
-        priority_penalty = 1.0 - r["priority_score"]
-        r["multi_objective_score"] = round(
-            prof_weights["time"] * time_norm[i]
-            + prof_weights["dist"] * dist_norm[i]
-            + prof_weights["prayer"] * r["prayer_penalty"]
-            + prof_weights["capacity"] * capacity_penalty
-            + prof_weights["priority"] * priority_penalty,
-            4,
-        )
+    apply_multi_objective_scores(results, profile, cost_parameters)
 
     elapsed_ms = round((time.perf_counter() - start_clock) * 1000, 2)
     return _format_route_response(
@@ -1139,7 +1358,7 @@ def _osrm_route(start: Coordinate, mosque: Coordinate, end: Coordinate) -> Dict[
             "steps": "false",
             "annotations": "false",
         },
-        timeout=6,
+        timeout=(OSRM_CONNECT_TIMEOUT_SECONDS, OSRM_READ_TIMEOUT_SECONDS),
     )
     response.raise_for_status()
     payload = response.json()
@@ -1192,6 +1411,7 @@ def _route_via_osrm_fallback(
     profile: str = "balanced",
 ) -> Dict[str, Any]:
     start_clock = time.perf_counter()
+    prayer_time = _resolve_prayer_time_string(prayer_time, start_lat, start_lon)
     results: List[Dict[str, Any]] = []
     candidate_pool = candidates[: min(len(candidates), max(requested_candidates, 6))]
     last_error = ""
@@ -1278,39 +1498,10 @@ def _route_via_osrm_fallback(
             end_lon=end_lon,
             fallback_note=f"OSRM juga gagal ({last_error or 'tidak ada rute'}). {fallback_note}",
             profile=profile,
+            cost_parameters=cost_parameters,
         )
 
-    # Dynamic weighting based on profile
-    weights = {
-        "fastest": {
-            "time": 0.70, "dist": 0.10, "prayer": 0.10, "capacity": 0.05, "priority": 0.05
-        },
-        "prayer_priority": {
-            "time": 0.20, "dist": 0.10, "prayer": 0.60, "capacity": 0.05, "priority": 0.05
-        },
-        "low_cost": {
-            "time": 0.20, "dist": 0.60, "prayer": 0.10, "capacity": 0.05, "priority": 0.05
-        },
-        "balanced": {
-            "time": 0.40, "dist": 0.20, "prayer": 0.20, "capacity": 0.10, "priority": 0.10
-        }
-    }
-    
-    prof_weights = weights.get(profile.lower(), weights["balanced"])
-
-    time_norm = _normalise_values([r["estimated_time_minutes"] for r in results])
-    dist_norm = _normalise_values([r["distance_km"] for r in results])
-    for i, r in enumerate(results):
-        capacity_penalty = 1.0 - r["capacity_score"]
-        priority_penalty = 1.0 - r["priority_score"]
-        r["multi_objective_score"] = round(
-            prof_weights["time"] * time_norm[i]
-            + prof_weights["dist"] * dist_norm[i]
-            + prof_weights["prayer"] * r["prayer_penalty"]
-            + prof_weights["capacity"] * capacity_penalty
-            + prof_weights["priority"] * priority_penalty,
-            4,
-        )
+    apply_multi_objective_scores(results, profile, cost_parameters)
 
     elapsed_ms = round((time.perf_counter() - start_clock) * 1000, 2)
     # Formulasi alasan (reason) secara dinamis agar lebih akurat & ramah pengguna
@@ -1357,6 +1548,9 @@ def _route_to_mosque_uncached(
     dataset_id: Optional[str] = None,
     fetch_mosques_fn: Optional[Callable] = None,
     save_osm_cache_fn: Optional[Callable] = None,
+    cost_parameters: Optional[Dict[str, Any]] = None,
+    current_time: Optional[str] = None,
+    prayer_time: Optional[str] = None,
 ) -> Dict[str, Any]:
     request_started = time.perf_counter()
     phase_timings_ms: Dict[str, float] = {}
@@ -1376,14 +1570,15 @@ def _route_to_mosque_uncached(
             end=mosque_point,
             candidates=[mosque],
             requested_candidates=requested_candidates,
-            current_time=None,
-            prayer_time=None,
+            current_time=current_time,
+            prayer_time=prayer_time,
             dataset_id=dataset_id,
             start_lat=start_lat,
             start_lon=start_lon,
             end_lat=mosque_point[0],
             end_lon=mosque_point[1],
             fallback_note="Graph OSM lokal sedang dipanaskan. OSRM dipakai agar request tidak menunggu cold-load GraphML.",
+            cost_parameters=cost_parameters,
         )
         phase_timings_ms["graph_readiness_check"] = round(
             (time.perf_counter() - graph_phase_started) * 1000, 2
@@ -1398,14 +1593,15 @@ def _route_to_mosque_uncached(
             end=mosque_point,
             candidates=[mosque],
             requested_candidates=requested_candidates,
-            current_time=None,
-            prayer_time=None,
+            current_time=current_time,
+            prayer_time=prayer_time,
             dataset_id=dataset_id,
             start_lat=start_lat,
             start_lon=start_lon,
             end_lat=mosque_point[0],
             end_lon=mosque_point[1],
             fallback_note="Cache graph OSM lokal belum ada, sehingga Dijkstra lokal belum dapat dijalankan.",
+            cost_parameters=cost_parameters,
         )
 
     if auto_build_osm:
@@ -1423,14 +1619,15 @@ def _route_to_mosque_uncached(
                     end=mosque_point,
                     candidates=[mosque],
                     requested_candidates=requested_candidates,
-                    current_time=None,
-                    prayer_time=None,
+                    current_time=current_time,
+                    prayer_time=prayer_time,
                     dataset_id=dataset_id,
                     start_lat=start_lat,
                     start_lon=start_lon,
                     end_lat=mosque_point[0],
                     end_lon=mosque_point[1],
                     fallback_note=skip_note,
+                    cost_parameters=cost_parameters,
                 )
             try:
                 G = build_osm_graph_for_route(
@@ -1447,14 +1644,15 @@ def _route_to_mosque_uncached(
                     end=mosque_point,
                     candidates=[mosque],
                     requested_candidates=requested_candidates,
-                    current_time=None,
-                    prayer_time=None,
+                    current_time=current_time,
+                    prayer_time=prayer_time,
                     dataset_id=dataset_id,
                     start_lat=start_lat,
                     start_lon=start_lon,
                     end_lat=mosque_point[0],
                     end_lon=mosque_point[1],
                     fallback_note=f"Build/download OSM gagal: {exc}",
+                    cost_parameters=cost_parameters,
                 )
             if save_osm_cache_fn:
                 save_osm_cache_fn(
@@ -1477,14 +1675,15 @@ def _route_to_mosque_uncached(
             end=mosque_point,
             candidates=[mosque],
             requested_candidates=requested_candidates,
-            current_time=None,
-            prayer_time=None,
+            current_time=current_time,
+            prayer_time=prayer_time,
             dataset_id=dataset_id,
             start_lat=start_lat,
             start_lon=start_lon,
             end_lat=mosque_point[0],
             end_lon=mosque_point[1],
             fallback_note="Cache graph OSM lokal belum mencakup titik awal atau masjid tujuan.",
+            cost_parameters=cost_parameters,
         )
 
     snap_started = time.perf_counter()
@@ -1502,14 +1701,15 @@ def _route_to_mosque_uncached(
             end=mosque_point,
             candidates=[mosque],
             requested_candidates=requested_candidates,
-            current_time=None,
-            prayer_time=None,
+            current_time=current_time,
+            prayer_time=prayer_time,
             dataset_id=dataset_id,
             start_lat=start_lat,
             start_lon=start_lon,
             end_lat=mosque_point[0],
             end_lon=mosque_point[1],
             fallback_note=f"Titik jalan lokal tidak ditemukan: {exc}",
+            cost_parameters=cost_parameters,
         )
     phase_timings_ms["snap_to_road"] = round((time.perf_counter() - snap_started) * 1000, 2)
 
@@ -1522,6 +1722,10 @@ def _route_to_mosque_uncached(
     connector_m = snapped_route["connector_m"]
     capacity_num = {"large": 1.0, "medium": 0.65, "small": 0.35}.get(mosque.get("capacity_proxy"), 0.5)
     priority = float(mosque.get("priority_score", 0.5))
+
+    resolved_prayer = _resolve_prayer_time_string(prayer_time, start_lat, start_lon)
+    prayer_penalty, arrival_status, minutes_before_prayer = _prayer_arrival_details(time_s / 60, current_time, resolved_prayer)
+
     result = {
         "mosque": mosque,
         "distance_km": round(dist_m / 1000, 3),
@@ -1530,7 +1734,9 @@ def _route_to_mosque_uncached(
         "route_nodes_count": len(road_coords),
         "capacity_score": capacity_num,
         "priority_score": priority,
-        "prayer_penalty": 0.0,
+        "prayer_penalty": prayer_penalty,
+        "arrival_status": arrival_status,
+        "minutes_before_prayer": round(minutes_before_prayer, 1),
         "route_coordinates": road_coords,
         "route_segments": [road_coords],
         "access_connectors": snapped_route["access_connectors"],
@@ -1541,8 +1747,8 @@ def _route_to_mosque_uncached(
             "destination_connector_m": round(snapped_route["destination_snap"].connector_m, 2),
             "snap_mode": "edge_projection",
         },
-        "multi_objective_score": round(0.10 * (1.0 - capacity_num) + 0.10 * (1.0 - priority), 4),
     }
+    apply_multi_objective_scores([result], "balanced", cost_parameters)
     phase_timings_ms["geometry_and_metrics"] = round(
         (time.perf_counter() - geometry_started) * 1000, 2
     )
@@ -1575,6 +1781,8 @@ def _route_cache_key(
     algorithm: str,
     graphml_path: Path,
     dataset_id: Optional[str],
+    current_time: Optional[str] = None,
+    prayer_time: Optional[str] = None,
 ) -> tuple:
     try:
         graph_version = graphml_path.stat().st_mtime_ns
@@ -1592,6 +1800,8 @@ def _route_cache_key(
         round(float(mosque["latitude"]), 5),
         round(float(mosque["longitude"]), 5),
         algorithm.lower(),
+        current_time,
+        prayer_time,
     )
 
 
@@ -1607,6 +1817,9 @@ def route_to_mosque(
     dataset_id: Optional[str] = None,
     fetch_mosques_fn: Optional[Callable] = None,
     save_osm_cache_fn: Optional[Callable] = None,
+    cost_parameters: Optional[Dict[str, Any]] = None,
+    current_time: Optional[str] = None,
+    prayer_time: Optional[str] = None,
 ) -> Dict[str, Any]:
     key = _route_cache_key(
         start_lat=start_lat,
@@ -1615,11 +1828,21 @@ def route_to_mosque(
         algorithm=algorithm,
         graphml_path=graphml_path,
         dataset_id=dataset_id,
+        current_time=current_time,
+        prayer_time=prayer_time,
     )
     now = time.monotonic()
+
+    def cache_is_reusable(cached_entry: tuple[float, Dict[str, Any]], checked_at: float) -> bool:
+        if checked_at - cached_entry[0] > ROUTE_CACHE_TTL_SECONDS:
+            return False
+        if cached_entry[1].get("routing_mode") == "local_graph":
+            return True
+        return not bool(get_road_graph_status(graphml_path).get("ready"))
+
     with _ROUTE_CACHE_LOCK:
         cached = _ROUTE_CACHE.get(key)
-        if cached and now - cached[0] <= ROUTE_CACHE_TTL_SECONDS:
+        if cached and cache_is_reusable(cached, now):
             _ROUTE_CACHE.move_to_end(key)
             result = copy.deepcopy(cached[1])
             result["cache_hit"] = True
@@ -1633,7 +1856,7 @@ def route_to_mosque(
         now = time.monotonic()
         with _ROUTE_CACHE_LOCK:
             cached = _ROUTE_CACHE.get(key)
-            if cached and now - cached[0] <= ROUTE_CACHE_TTL_SECONDS:
+            if cached and cache_is_reusable(cached, now):
                 _ROUTE_CACHE.move_to_end(key)
                 result = copy.deepcopy(cached[1])
                 result["cache_hit"] = True
@@ -1650,6 +1873,9 @@ def route_to_mosque(
             dataset_id=dataset_id,
             fetch_mosques_fn=fetch_mosques_fn,
             save_osm_cache_fn=save_osm_cache_fn,
+            cost_parameters=cost_parameters,
+            current_time=current_time,
+            prayer_time=prayer_time,
         )
         result["cache_hit"] = False
         with _ROUTE_CACHE_LOCK:
@@ -1676,6 +1902,7 @@ def route_via_osm_dijkstra(
     fetch_mosques_fn: Optional[Callable] = None,
     save_osm_cache_fn: Optional[Callable] = None,
     profile: str = "balanced",
+    cost_parameters: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     request_started = time.perf_counter()
     phase_timings_ms: Dict[str, float] = {}
@@ -1685,34 +1912,7 @@ def route_via_osm_dijkstra(
 
     # Resolve prayer name to HH:MM time
     prayer_started = time.perf_counter()
-    if prayer_time and prayer_time.lower() in {"fajr", "subuh", "dhuhr", "dzuhur", "asr", "ashar", "maghrib", "isha", "isya"}:
-        resolved_name = prayer_time.lower()
-        name_map = {
-            "subuh": "fajr",
-            "dzuhur": "dhuhr",
-            "ashar": "asr",
-            "isya": "isha"
-        }
-        api_name = name_map.get(resolved_name, resolved_name)
-        from app.infrastructure.services.prayer_time import calculate_offline_prayer_times
-        import datetime as dt_module
-        try:
-            timings = calculate_offline_prayer_times(float(start_lat), float(start_lon), dt_module.date.today())
-            raw_time = timings.get(api_name)
-            if raw_time:
-                match = re.search(r"\d{2}:\d{2}", raw_time)
-                prayer_time = match.group(0) if match else raw_time
-            else:
-                prayer_time = None
-        except Exception:
-            fallback_map = {
-                "fajr": "04:45",
-                "dhuhr": "12:00",
-                "asr": "15:15",
-                "maghrib": "18:00",
-                "isha": "19:15"
-            }
-            prayer_time = fallback_map.get(api_name, "18:00")
+    prayer_time = _resolve_prayer_time_string(prayer_time, start_lat, start_lon)
     phase_timings_ms["prayer_resolution"] = round((time.perf_counter() - prayer_started) * 1000, 2)
 
     requested_candidates = max(1, int(max_candidates))
@@ -1793,6 +1993,7 @@ def route_via_osm_dijkstra(
             end_lon=end_lon,
             fallback_note="Graph OSM lokal sedang dipanaskan. OSRM dipakai agar request tidak menunggu cold-load GraphML.",
             profile=profile,
+            cost_parameters=cost_parameters,
         )
         phase_timings_ms["graph_readiness_check"] = round(
             (time.perf_counter() - graph_phase_started) * 1000, 2
@@ -1816,6 +2017,7 @@ def route_via_osm_dijkstra(
             end_lon=end_lon,
             fallback_note="Cache graph OSM lokal belum ada. Gunakan tombol Bangun Graph OSM Manual untuk membuat rute jalan OSM saat koneksi Overpass stabil.",
             profile=profile,
+            cost_parameters=cost_parameters,
         )
 
     if auto_build_osm:
@@ -1845,6 +2047,7 @@ def route_via_osm_dijkstra(
                     end_lon=end_lon,
                     fallback_note=skip_note,
                     profile=profile,
+                    cost_parameters=cost_parameters,
                 )
             try:
                 G = build_osm_graph_for_route(
@@ -1871,6 +2074,7 @@ def route_via_osm_dijkstra(
                     end_lon=end_lon,
                     fallback_note=f"Build/download OSM gagal: {exc}",
                     profile=profile,
+                    cost_parameters=cost_parameters,
                 )
             if save_osm_cache_fn:
                 save_osm_cache_fn(
@@ -1905,6 +2109,7 @@ def route_via_osm_dijkstra(
                 f"(bounds cache: S {south:.4f}, N {north:.4f}, W {west:.4f}, E {east:.4f})."
             ),
             profile=profile,
+            cost_parameters=cost_parameters,
         )
     south, north, west, east = graph_bounds(G)
     mid_lat = (start[0] + end[0]) / 2
@@ -1934,6 +2139,7 @@ def route_via_osm_dijkstra(
             end_lon=end_lon,
             fallback_note="Graph OSM ada, tetapi kandidat masjid di koridor belum masuk area graph.",
             profile=profile,
+            cost_parameters=cost_parameters,
         )
 
     snap_started = time.perf_counter()
@@ -1980,6 +2186,7 @@ def route_via_osm_dijkstra(
             end_lon=end_lon,
             fallback_note=f"Edge snapping lokal gagal: {exc}",
             profile=profile,
+            cost_parameters=cost_parameters,
         )
     phase_timings_ms["snap_to_road"] = round((time.perf_counter() - snap_started) * 1000, 2)
 
@@ -2047,40 +2254,11 @@ def route_via_osm_dijkstra(
             end_lon=end_lon,
             fallback_note=f"Tidak ada kandidat masjid yang dapat dirutekan pada graph OSM dari {len(candidates_in_graph)} kandidat.",
             profile=profile,
+            cost_parameters=cost_parameters,
         )
 
-    # Dynamic weighting based on profile
     scoring_started = time.perf_counter()
-    weights = {
-        "fastest": {
-            "time": 0.70, "dist": 0.10, "prayer": 0.10, "capacity": 0.05, "priority": 0.05
-        },
-        "prayer_priority": {
-            "time": 0.20, "dist": 0.10, "prayer": 0.60, "capacity": 0.05, "priority": 0.05
-        },
-        "low_cost": {
-            "time": 0.20, "dist": 0.60, "prayer": 0.10, "capacity": 0.05, "priority": 0.05
-        },
-        "balanced": {
-            "time": 0.40, "dist": 0.20, "prayer": 0.20, "capacity": 0.10, "priority": 0.10
-        }
-    }
-    
-    prof_weights = weights.get(profile.lower(), weights["balanced"])
-
-    time_norm = _normalise_values([r["estimated_time_minutes"] for r in results])
-    dist_norm = _normalise_values([r["distance_km"] for r in results])
-    for i, r in enumerate(results):
-        capacity_penalty = 1.0 - r["capacity_score"]
-        priority_penalty = 1.0 - r["priority_score"]
-        r["multi_objective_score"] = round(
-            prof_weights["time"] * time_norm[i]
-            + prof_weights["dist"] * dist_norm[i]
-            + prof_weights["prayer"] * r["prayer_penalty"]
-            + prof_weights["capacity"] * capacity_penalty
-            + prof_weights["priority"] * priority_penalty,
-            4,
-        )
+    apply_multi_objective_scores(results, profile, cost_parameters)
 
     results.sort(key=lambda x: x["multi_objective_score"])
     best_res = results[0]
@@ -2153,12 +2331,20 @@ def route_via_osm_dijkstra(
     phase_timings_ms["total"] = round((time.perf_counter() - request_started) * 1000, 2)
     elapsed_ms = phase_timings_ms["total"]
 
+    requested_astar = algorithm.lower() in {"astar", "a*"}
+    astar_fallback_used = requested_astar and final_path_algorithm != "astar_edge_projection"
+    if requested_astar and not astar_fallback_used:
+        algorithm_label = "A* (Dijkstra Multi-Destination Ranking)"
+        actual_algorithm = "astar"
+    elif requested_astar:
+        algorithm_label = "Dijkstra (Fallback dari A*)"
+        actual_algorithm = "dijkstra"
+    else:
+        algorithm_label = "Dijkstra (Multi-Destination)"
+        actual_algorithm = "dijkstra"
+
     response = _format_route_response(
-        algorithm_label=(
-            "A* (Dijkstra Multi-Destination Ranking)"
-            if algorithm.lower() in {"astar", "a*"}
-            else "Dijkstra (Multi-Destination)"
-        ),
+        algorithm_label=algorithm_label,
         road_network="OpenStreetMap via OSMnx/NetworkX",
         routing_weight="travel_time_seconds",
         dataset_id=dataset_id,
@@ -2176,6 +2362,9 @@ def route_via_osm_dijkstra(
         ),
     )
     response["pathfinding"] = {
+        "requested_algorithm": "astar" if requested_astar else "dijkstra",
+        "actual_algorithm": actual_algorithm,
+        "fallback_used": astar_fallback_used,
         "candidate_ranking_algorithm": "dijkstra_edge_projection_batch",
         "final_path_algorithm": final_path_algorithm,
     }

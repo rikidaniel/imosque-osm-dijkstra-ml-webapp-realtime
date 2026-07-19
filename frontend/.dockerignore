@@ -1,0 +1,9 @@
+.next/
+node_modules/
+.pytest_cache/
+*.log
+.env*
+AGENTS.md
+CLAUDE.md
+index.html
+app.js

@@ -2,10 +2,11 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from app.interfaces.api.routes import router, routing_usecases
-from app.infrastructure.database.arangodb_client import init_db
+from app.interfaces.api.routes import router, routing_gateway, routing_usecases
+from app.infrastructure.database.arangodb_client import init_db, is_db_initialized
 
 
 def _preload_active_road_graph() -> None:
@@ -31,7 +32,10 @@ def startup_event() -> None:
     # Prewarm runs on a daemon thread, so health and nearest-mosque APIs remain
     # available while route requests temporarily use their configured fallback.
     # Operators with very tight startup CPU/RAM limits can explicitly opt out.
-    if os.getenv("IMOSQUE_PREWARM_GRAPH_ON_STARTUP", "true").lower() in {"1", "true", "yes"}:
+    if (
+        not routing_gateway.remote_enabled
+        and os.getenv("IMOSQUE_PREWARM_GRAPH_ON_STARTUP", "true").lower() in {"1", "true", "yes"}
+    ):
         _preload_active_road_graph()
 
 
@@ -48,6 +52,7 @@ app = FastAPI(
     ),
     version="4.0.0",
     lifespan=lifespan,
+    docs_url=None,  # Disable default Swagger UI
 )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -60,3 +65,31 @@ app.add_middleware(
 )
 
 app.include_router(router, prefix="/api/v1")
+
+@app.get("/docs", include_in_schema=False)
+async def custom_scalar_docs_html():
+    return HTMLResponse(
+        content="""
+        <!doctype html>
+        <html>
+          <head>
+            <title>iMosque API Documentation</title>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <style>
+              body {
+                margin: 0;
+              }
+            </style>
+          </head>
+          <body>
+            <script
+              id="api-reference"
+              data-url="/openapi.json"
+              data-configuration='{"theme": "emerald", "showSidebar": true, "layout": "modern"}'
+            ></script>
+            <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+          </body>
+        </html>
+        """
+    )

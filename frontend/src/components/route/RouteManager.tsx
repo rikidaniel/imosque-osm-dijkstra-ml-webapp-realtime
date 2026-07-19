@@ -9,10 +9,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { toast } from "sonner";
 import { MapPin, Navigation, Clock, Locate } from "lucide-react";
 import { isAbortError, isRouteCacheFresh, RECOMMENDATION_CACHE_TTL_MS } from "@/lib/api";
-
-const API_BASE = typeof window !== "undefined"
-  ? `http://${window.location.hostname}:8000`
-  : "http://127.0.0.1:8000";
+import { API_BASE } from "@/lib/config";
+import { buildNationalDepartureTime } from "@/lib/prayer-routing";
 
 export default function RouteManager() {
   const { activeDatasetId, startPoint, endPoint, mosques, setRouteData, setStartPoint, setEndPoint, routeCache, setRouteCache } = useAppStore();
@@ -22,7 +20,7 @@ export default function RouteManager() {
   
   const [algorithm, setAlgorithm] = useState("dijkstra");
   const [currentTime, setCurrentTime] = useState("17:00");
-  const [prayer, setPrayer] = useState("maghrib");
+  const [prayer, setPrayer] = useState("auto");
   const [profile, setProfile] = useState("balanced");
   const [maxCandidates, setMaxCandidates] = useState("3");
   const [bufferKm, setBufferKm] = useState("10");
@@ -112,6 +110,7 @@ export default function RouteManager() {
     let timedOut = false;
     setLoading(true);
     try {
+      const departureContext = buildNationalDepartureTime("scheduled", currentTime, startPoint.lng);
       const payload = {
         dataset_id: activeDatasetId,
         origin: {
@@ -126,7 +125,7 @@ export default function RouteManager() {
           longitude: startPoint.lng
         },
         algorithm: algorithm,
-        departure_time: `${new Date().toLocaleDateString("en-CA")}T${currentTime || '17:00'}:00+07:00`,
+        departure_time: departureContext.iso,
         prayer: prayer,
         profile: profile,
         maximum_results: parseInt(maxCandidates),
@@ -334,6 +333,7 @@ export default function RouteManager() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="auto">Otomatis — salat berikutnya</SelectItem>
                   <SelectItem value="subuh">Subuh</SelectItem>
                   <SelectItem value="dzuhur">Dzuhur</SelectItem>
                   <SelectItem value="ashar">Ashar</SelectItem>

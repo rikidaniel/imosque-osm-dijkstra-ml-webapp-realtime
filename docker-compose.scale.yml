@@ -1,0 +1,161 @@
+# Staging/reference topology for the national-scale migration.
+# Production must replace the single-node ArangoDB and Kafka definitions with
+# multi-node clusters or managed equivalents across failure domains.
+
+services:
+  arangodb:
+    image: ${ARANGO_IMAGE:-arangodb:3.11.8}
+    environment:
+      ARANGO_ROOT_PASSWORD: ${ARANGO_ROOT_PASSWORD:-imosque_password}
+    volumes:
+      - arangodb_data:/var/lib/arangodb3
+    restart: unless-stopped
+    networks: [imosque]
+
+  kafka:
+    image: ${KAFKA_IMAGE:-apache/kafka:4.3.0}
+    profiles: [realtime]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 12
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    restart: unless-stopped
+    networks: [imosque]
+
+  kafka-init:
+    image: ${KAFKA_IMAGE:-apache/kafka:4.3.0}
+    profiles: [realtime]
+    depends_on: [kafka]
+    restart: "no"
+    networks: [imosque]
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        until /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1; do sleep 2; done
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic imosque.location.v1 --partitions 12 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic imosque.traffic-snapshot.v1 --partitions 12 --replication-factor 1 --config cleanup.policy=compact
+
+  flink-jobmanager:
+    build:
+      context: ./realtime/flink
+    profiles: [realtime]
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        execution.checkpointing.interval: 30s
+        parallelism.default: 2
+    volumes:
+      - flink_checkpoints:/opt/flink/checkpoints
+    restart: unless-stopped
+    networks: [imosque]
+
+  flink-taskmanager:
+    build:
+      context: ./realtime/flink
+    profiles: [realtime]
+    depends_on: [flink-jobmanager]
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        execution.checkpointing.interval: 30s
+        parallelism.default: 2
+    volumes:
+      - flink_checkpoints:/opt/flink/checkpoints
+    restart: unless-stopped
+    networks: [imosque]
+
+  flink-sql-submit:
+    build:
+      context: ./realtime/flink
+    profiles: [realtime]
+    depends_on: [flink-jobmanager, flink-taskmanager, kafka-init]
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        until curl -fsS http://flink-jobmanager:8081/overview >/dev/null; do sleep 2; done
+        /opt/flink/bin/sql-client.sh -f /opt/flink/usrlib/traffic_aggregation.sql
+    networks: [imosque]
+
+  routing-worker:
+    build:
+      context: ./backend
+    command: ["uvicorn", "app.routing_worker:app", "--host", "0.0.0.0", "--port", "8010", "--workers", "1"]
+    environment:
+      ARANGO_HOST: http://arangodb:8529
+      ARANGO_ROOT_PASSWORD: ${ARANGO_ROOT_PASSWORD:-imosque_password}
+      IMOSQUE_ROUTING_DATASET_IDS: ${ROUTING_DATASET_IDS:-}
+      IMOSQUE_ROUTING_INTERNAL_TOKEN: ${ROUTING_INTERNAL_TOKEN:-change-me}
+      IMOSQUE_PREWARM_GRAPH_ON_STARTUP: "true"
+      IMOSQUE_ALLOW_INLINE_OSM_BUILD: "false"
+      IMOSQUE_CORRIDOR_CACHE_DIR: ${IMOSQUE_CORRIDOR_CACHE_DIR:-/srv/data/osm_cache/route_corridors}
+      IMOSQUE_CORRIDOR_MAX_GRAPHS: ${IMOSQUE_CORRIDOR_MAX_GRAPHS:-256}
+      IMOSQUE_CORRIDOR_MAX_CONCURRENT_BUILDS: ${IMOSQUE_CORRIDOR_MAX_CONCURRENT_BUILDS:-1}
+    volumes:
+      - ./data:/srv/data
+    depends_on: [arangodb]
+    restart: unless-stopped
+    networks: [imosque]
+
+  api:
+    build:
+      context: ./backend
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    ports:
+      - "8000:8000"
+    environment:
+      ARANGO_HOST: http://arangodb:8529
+      ARANGO_ROOT_PASSWORD: ${ARANGO_ROOT_PASSWORD:-imosque_password}
+      IMOSQUE_ROUTING_WORKER_URL: http://routing-worker:8010
+      IMOSQUE_ROUTING_INTERNAL_TOKEN: ${ROUTING_INTERNAL_TOKEN:-change-me}
+      IMOSQUE_ROUTING_REMOTE_FALLBACK: "false"
+      IMOSQUE_PREWARM_GRAPH_ON_STARTUP: "false"
+      IMOSQUE_KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-}
+      IMOSQUE_EVENT_PSEUDONYM_SECRET: ${EVENT_PSEUDONYM_SECRET:-}
+      IMOSQUE_ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in .env.scale before starting the national stack}
+      IMOSQUE_CORRIDOR_CACHE_DIR: ${IMOSQUE_CORRIDOR_CACHE_DIR:-/srv/data/osm_cache/route_corridors}
+      IMOSQUE_CORRIDOR_MAX_GRAPHS: ${IMOSQUE_CORRIDOR_MAX_GRAPHS:-256}
+      IMOSQUE_CORRIDOR_MAX_CONCURRENT_BUILDS: ${IMOSQUE_CORRIDOR_MAX_CONCURRENT_BUILDS:-1}
+    volumes:
+      - ./data:/srv/data
+    depends_on: [arangodb, routing-worker]
+    restart: unless-stopped
+    networks: [imosque]
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE: ${PUBLIC_API_BASE:-http://localhost:8000}
+        DEPLOYMENT_VERSION: ${DEPLOYMENT_VERSION:-local-scale}
+    ports:
+      - "3000:3000"
+    depends_on: [api]
+    restart: unless-stopped
+    networks: [imosque]
+
+volumes:
+  arangodb_data:
+  kafka_data:
+  flink_checkpoints:
+
+networks:
+  imosque:
+    driver: bridge

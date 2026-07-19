@@ -3,11 +3,20 @@ import copy
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from app.domain.repositories.mosque_repo import MosqueRepository
 from app.domain.repositories.dataset_repo import DatasetRepository
 from app.infrastructure.services.routing_osm import route_via_osm_dijkstra, route_to_mosque
-from app.infrastructure.services.osm_graph import build_osm_graph_for_bbox, build_osm_graph_for_route, graph_bounds, DEFAULT_GRAPHML, get_graphml_path
+from app.infrastructure.services.osm_graph import build_osm_graph_for_bbox, build_osm_graph_for_route, graph_bounds, DEFAULT_GRAPHML, get_graphml_path, start_road_graph_prewarm
+from app.infrastructure.services.route_graph_cache import (
+    CorridorAreaTooLarge,
+    corridor_graph_spec,
+    find_covering_corridor_graph,
+    metadata_covers_points,
+    register_corridor_graph,
+    start_corridor_graph_build,
+)
 
 class RoutingUseCases:
     def __init__(self, mosque_repo: MosqueRepository, dataset_repo: DatasetRepository):
@@ -39,6 +48,40 @@ class RoutingUseCases:
             if "data_revision" in dataset_profile
             else dataset_profile.get("_rev")
         )
+
+    def _resolve_route_graph_path(
+        self,
+        dataset_id: str,
+        points: tuple[tuple[float, float], ...],
+        buffer_km: float,
+    ):
+        corridor_path = find_covering_corridor_graph(dataset_id, points)
+        if corridor_path is not None:
+            start_road_graph_prewarm(corridor_path)
+            return corridor_path
+
+        base_path = get_graphml_path(dataset_id)
+        try:
+            base_metadata = self.dataset_repo.get_osm_cache(dataset_id)
+        except Exception:
+            base_metadata = None
+        if base_path.exists() and (
+            not base_metadata or metadata_covers_points(base_metadata, points)
+        ):
+            return base_path
+
+        try:
+            job = start_corridor_graph_build(
+                dataset_id,
+                points,
+                buffer_km=min(float(buffer_km), 10.0),
+            )
+            job_path = Path(str(job.get("graphml_path", "")))
+            if str(job_path) not in {"", "."}:
+                return job_path
+        except CorridorAreaTooLarge:
+            pass
+        return base_path
 
     def _get_cached_mosque_candidates(self, dataset_id: str, data_revision: Any) -> Optional[List[Dict[str, Any]]]:
         cache_key = (str(dataset_id), data_revision)
@@ -130,7 +173,8 @@ class RoutingUseCases:
         auto_build_osm: bool,
         buffer_km: float,
         dataset_id: str,
-        profile: str = "balanced"
+        profile: str = "balanced",
+        cost_parameters: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         # Provide a repository callback for routing to fetch mosques
         def fetch_mosques(did: str, bounds: Optional[tuple[float, float, float, float]] = None) -> List[Dict[str, Any]]:
@@ -165,7 +209,13 @@ class RoutingUseCases:
         def save_osm_cache(cache_id: str = "latest", **kwargs):
             self.dataset_repo.save_osm_cache(cache_id, kwargs)
             
-        g_path = get_graphml_path(dataset_id)
+        route_points = (
+            (float(start_lat), float(start_lon)),
+            (float(end_lat), float(end_lon)),
+        )
+        g_path = self._resolve_route_graph_path(
+            dataset_id, route_points, buffer_km
+        )
         try:
             dataset_profile = self.dataset_repo.get_dataset(dataset_id) or {}
         except Exception:
@@ -181,6 +231,7 @@ class RoutingUseCases:
             round(float(end_lat), 4), round(float(end_lon), 4),
             algorithm.lower(), current_time, prayer_time, int(max_candidates),
             round(float(buffer_km), 2), profile.lower(),
+            tuple(sorted((cost_parameters or {}).items())),
         )
 
         def get_cached():
@@ -218,6 +269,7 @@ class RoutingUseCases:
                 buffer_km=buffer_km,
                 dataset_id=dataset_id,
                 profile=profile,
+                cost_parameters=cost_parameters,
                 graphml_path=g_path,
                 fetch_mosques_fn=fetch_mosques,
                 save_osm_cache_fn=save_osm_cache
@@ -237,7 +289,10 @@ class RoutingUseCases:
         algorithm: str,
         auto_build_osm: bool,
         buffer_km: float,
-        dataset_id: str
+        dataset_id: str,
+        cost_parameters: Optional[Dict[str, Any]] = None,
+        current_time: Optional[str] = None,
+        prayer_time: Optional[str] = None,
     ) -> Dict[str, Any]:
         def save_osm_cache(cache_id: str = "latest", **kwargs):
             self.dataset_repo.save_osm_cache(cache_id, kwargs)
@@ -246,7 +301,13 @@ class RoutingUseCases:
         if not mosque:
             raise ValueError(f"Mosque {mosque_id} not found")
             
-        g_path = get_graphml_path(dataset_id)
+        route_points = (
+            (float(start_lat), float(start_lon)),
+            (float(mosque["latitude"]), float(mosque["longitude"])),
+        )
+        g_path = self._resolve_route_graph_path(
+            dataset_id, route_points, buffer_km
+        )
         return route_to_mosque(
             start_lat=start_lat,
             start_lon=start_lon,
@@ -256,7 +317,10 @@ class RoutingUseCases:
             buffer_km=buffer_km,
             dataset_id=dataset_id,
             graphml_path=g_path,
-            save_osm_cache_fn=save_osm_cache
+            save_osm_cache_fn=save_osm_cache,
+            cost_parameters=cost_parameters,
+            current_time=current_time,
+            prayer_time=prayer_time,
         )
 
     def build_osm_bbox(self, north: float, south: float, east: float, west: float, network_type: str, dataset_id: Optional[str] = None, build_scope: str = "custom_bbox") -> Dict[str, Any]:
@@ -282,28 +346,33 @@ class RoutingUseCases:
         }
 
     def build_osm_route(self, start_lat: float, start_lon: float, end_lat: float, end_lon: float, buffer_km: float, network_type: str, dataset_id: Optional[str] = None) -> Dict[str, Any]:
-        g_path = get_graphml_path(dataset_id)
-        G = build_osm_graph_for_route(
-            start_lat=start_lat,
-            start_lon=start_lon,
-            end_lat=end_lat,
-            end_lon=end_lon,
+        resolved_dataset_id = dataset_id or "regional"
+        spec = corridor_graph_spec(
+            resolved_dataset_id,
+            ((float(start_lat), float(start_lon)), (float(end_lat), float(end_lon))),
             buffer_km=buffer_km,
+            network_type=network_type,
+        )
+        g_path = Path(spec.graphml_path)
+        G = build_osm_graph_for_bbox(
+            north=spec.north,
+            south=spec.south,
+            east=spec.east,
+            west=spec.west,
             network_type=network_type,
             output_graphml=g_path,
         )
-        bounds = graph_bounds(G)
-        self.dataset_repo.save_osm_cache(dataset_id or "latest", {
-            "graphml_path": str(g_path),
-            "south": bounds[0], "north": bounds[1], "west": bounds[2], "east": bounds[3],
-            "buffer_km": buffer_km, "network_type": network_type,
-            "nodes": len(G.nodes), "edges": len(G.edges),
-            "ingest_graph": False,
-        })
+        metadata = register_corridor_graph(spec, G)
         return {
             "status": "success",
+            "graph_id": spec.graph_id,
             "cache_path": str(g_path),
             "nodes": len(G.nodes), "edges": len(G.edges),
             "buffer_km": buffer_km,
-            "network_type": network_type
+            "network_type": network_type,
+            "build_scope": "route_corridor",
+            "bounds": {
+                "south": metadata["south"], "north": metadata["north"],
+                "west": metadata["west"], "east": metadata["east"],
+            },
         }

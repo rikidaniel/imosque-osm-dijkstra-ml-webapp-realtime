@@ -85,6 +85,35 @@
   --sidebar-ring: oklch(0.55 0.20 160);
 }
 
+.dark {
+  --background: oklch(0.12 0.015 260); /* Deep slate dark blue */
+  --foreground: oklch(0.98 0.005 260);
+  --card: oklch(0.16 0.02 260);
+  --card-foreground: oklch(0.98 0.005 260);
+  --popover: oklch(0.16 0.02 260);
+  --popover-foreground: oklch(0.98 0.005 260);
+  --primary: oklch(0.65 0.22 165); /* Vibrant emerald green */
+  --primary-foreground: oklch(0.12 0.015 260);
+  --secondary: oklch(0.20 0.02 260);
+  --secondary-foreground: oklch(0.98 0.005 260);
+  --muted: oklch(0.18 0.02 260);
+  --muted-foreground: oklch(0.65 0.01 260);
+  --accent: oklch(0.20 0.02 260);
+  --accent-foreground: oklch(0.98 0.005 260);
+  --destructive: oklch(0.45 0.20 27);
+  --border: oklch(0.22 0.02 260);
+  --input: oklch(0.22 0.02 260);
+  --ring: oklch(0.65 0.22 165);
+  --sidebar: oklch(0.14 0.018 260);
+  --sidebar-foreground: oklch(0.98 0.005 260);
+  --sidebar-primary: oklch(0.65 0.22 165);
+  --sidebar-primary-foreground: oklch(0.12 0.015 260);
+  --sidebar-accent: oklch(0.20 0.02 260);
+  --sidebar-accent-foreground: oklch(0.98 0.005 260);
+  --sidebar-border: oklch(0.22 0.02 260);
+  --sidebar-ring: oklch(0.65 0.22 165);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

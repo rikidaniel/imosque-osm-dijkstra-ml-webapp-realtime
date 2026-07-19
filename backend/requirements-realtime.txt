@@ -1,0 +1,2 @@
+-r requirements.txt
+confluent-kafka>=2.6

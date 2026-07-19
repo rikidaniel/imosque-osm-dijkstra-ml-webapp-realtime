@@ -1,0 +1,1001 @@
+{
+  "generated_at": "2026-07-18T15:31:22.379697+00:00",
+  "methodology": {
+    "seed": 20260718,
+    "requested_pairs": 20,
+    "completed_pairs": 20,
+    "minimum_straight_distance_km": 3.0,
+    "maximum_straight_distance_km": 35.0,
+    "shortest_path_weight": "travel_time_seconds",
+    "graph_warm": true,
+    "osrm_reference_enabled": false
+  },
+  "graph": {
+    "path": "C:\\Users\\Riki Daniel\\Documents\\GitHub\\imosque-osm-dijkstra-ml-webapp-realtime\\data\\osm_cache\\road_graph_dataset_masjid_imosque_table_mosque_dki_jakarta_1.graphml",
+    "size_bytes": 274779276,
+    "nodes": 196565,
+    "edges": 456186,
+    "directed": true
+  },
+  "summary": {
+    "dijkstra": {
+      "execution_time_ms": {
+        "mean": 348.876,
+        "median": 328.865,
+        "p95": 737.691,
+        "p99": 738.61,
+        "min": 7.18,
+        "max": 738.84
+      },
+      "memory_usage_kb": {
+        "mean": 32369.113,
+        "median": 30049.41,
+        "p95": 58521.73,
+        "p99": 70785.85,
+        "min": 404.44,
+        "max": 73851.88
+      },
+      "expanded_nodes": {
+        "mean": 35806.75,
+        "median": 36459.0,
+        "p95": 63073.3,
+        "p99": 70829.86,
+        "min": 1015.0,
+        "max": 72769.0
+      },
+      "examined_edges": {
+        "mean": 83175.25,
+        "median": 85197.0,
+        "p95": 146479.95,
+        "p99": 163214.39,
+        "min": 2405.0,
+        "max": 167398.0
+      },
+      "route_distance_km": {
+        "mean": 23.828,
+        "median": 24.96,
+        "p95": 36.349,
+        "p99": 42.399,
+        "min": 4.027,
+        "max": 43.912
+      }
+    },
+    "astar": {
+      "execution_time_ms": {
+        "mean": 581.236,
+        "median": 548.945,
+        "p95": 1192.818,
+        "p99": 1876.484,
+        "min": 15.54,
+        "max": 2047.4
+      },
+      "memory_usage_kb": {
+        "mean": 11077.472,
+        "median": 11097.89,
+        "p95": 26195.911,
+        "p99": 26258.846,
+        "min": 223.83,
+        "max": 26274.58
+      },
+      "expanded_nodes": {
+        "mean": 43156.25,
+        "median": 43162.0,
+        "p95": 92680.7,
+        "p99": 94089.74,
+        "min": 996.0,
+        "max": 94442.0
+      },
+      "examined_edges": {
+        "mean": 99296.85,
+        "median": 99176.5,
+        "p95": 210834.25,
+        "p99": 214045.25,
+        "min": 2354.0,
+        "max": 214848.0
+      },
+      "route_distance_km": {
+        "mean": 23.828,
+        "median": 24.96,
+        "p95": 36.349,
+        "p99": 42.399,
+        "min": 4.027,
+        "max": 43.912
+      }
+    },
+    "execution_time_wins": {
+      "dijkstra": 20,
+      "astar": 0,
+      "ties": 0
+    },
+    "optimal_cost_matches": 20,
+    "optimal_cost_match_rate_percent": 100.0,
+    "maximum_cost_difference_seconds": 0.0,
+    "osrm_accuracy": {
+      "validated_pairs": 0,
+      "distance_mape_percent": null,
+      "duration_mape_percent": null
+    }
+  },
+  "pairs": [
+    {
+      "pair_index": 1,
+      "source_node": "4922675771",
+      "target_node": "1359356772",
+      "origin": {
+        "latitude": -6.3624873,
+        "longitude": 106.8736455
+      },
+      "destination": {
+        "latitude": -6.245029,
+        "longitude": 106.9335217
+      },
+      "straight_distance_km": 14.642,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 36189,
+        "expanded_states": 36190,
+        "examined_edges": 86642,
+        "heuristic_calls": 0,
+        "execution_time_ms": 317.49,
+        "memory_usage_kb": 27566.63,
+        "route_nodes_count": 101,
+        "route_distance_km": 25.089,
+        "route_travel_time_seconds": 1532.231487
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 36401,
+        "expanded_states": 36401,
+        "examined_edges": 84947,
+        "heuristic_calls": 37651,
+        "execution_time_ms": 420.29,
+        "memory_usage_kb": 8629.06,
+        "route_nodes_count": 101,
+        "route_distance_km": 25.089,
+        "route_travel_time_seconds": 1532.231487
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 2,
+      "source_node": "5129946734",
+      "target_node": "4297446426",
+      "origin": {
+        "latitude": -6.3271816,
+        "longitude": 106.8374383
+      },
+      "destination": {
+        "latitude": -6.1784391,
+        "longitude": 106.6800068
+      },
+      "straight_distance_km": 24.008,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 50990,
+        "expanded_states": 50991,
+        "examined_edges": 117397,
+        "heuristic_calls": 0,
+        "execution_time_ms": 507.91,
+        "memory_usage_kb": 52427.91,
+        "route_nodes_count": 145,
+        "route_distance_km": 32.182,
+        "route_travel_time_seconds": 2142.869989
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 92588,
+        "expanded_states": 92588,
+        "examined_edges": 210623,
+        "heuristic_calls": 94146,
+        "execution_time_ms": 1147.84,
+        "memory_usage_kb": 26191.77,
+        "route_nodes_count": 145,
+        "route_distance_km": 32.182,
+        "route_travel_time_seconds": 2142.869989
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 3,
+      "source_node": "5042680830",
+      "target_node": "6420409426",
+      "origin": {
+        "latitude": -6.2395089,
+        "longitude": 106.8023265
+      },
+      "destination": {
+        "latitude": -6.1811155,
+        "longitude": 106.7620417
+      },
+      "straight_distance_km": 7.873,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 7451,
+        "expanded_states": 7452,
+        "examined_edges": 16419,
+        "heuristic_calls": 0,
+        "execution_time_ms": 54.05,
+        "memory_usage_kb": 4539.68,
+        "route_nodes_count": 56,
+        "route_distance_km": 12.921,
+        "route_travel_time_seconds": 801.27971
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 8858,
+        "expanded_states": 8858,
+        "examined_edges": 19601,
+        "heuristic_calls": 9437,
+        "execution_time_ms": 94.43,
+        "memory_usage_kb": 2137.19,
+        "route_nodes_count": 56,
+        "route_distance_km": 12.921,
+        "route_travel_time_seconds": 801.27971
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 4,
+      "source_node": "1363215579",
+      "target_node": "4996295839",
+      "origin": {
+        "latitude": -6.2143697,
+        "longitude": 106.8263494
+      },
+      "destination": {
+        "latitude": -6.3342816,
+        "longitude": 106.9015934
+      },
+      "straight_distance_km": 15.715,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 29001,
+        "expanded_states": 29002,
+        "examined_edges": 65982,
+        "heuristic_calls": 0,
+        "execution_time_ms": 240.52,
+        "memory_usage_kb": 24827.75,
+        "route_nodes_count": 128,
+        "route_distance_km": 24.684,
+        "route_travel_time_seconds": 1516.03169
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 44351,
+        "expanded_states": 44351,
+        "examined_edges": 100422,
+        "heuristic_calls": 45582,
+        "execution_time_ms": 538.89,
+        "memory_usage_kb": 13211.62,
+        "route_nodes_count": 128,
+        "route_distance_km": 24.684,
+        "route_travel_time_seconds": 1516.03169
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 5,
+      "source_node": "13083637898",
+      "target_node": "328919905",
+      "origin": {
+        "latitude": -6.210298,
+        "longitude": 106.9498667
+      },
+      "destination": {
+        "latitude": -6.1821817,
+        "longitude": 106.857727
+      },
+      "straight_distance_km": 10.655,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 22259,
+        "expanded_states": 22260,
+        "examined_edges": 52718,
+        "heuristic_calls": 0,
+        "execution_time_ms": 190.25,
+        "memory_usage_kb": 17039.76,
+        "route_nodes_count": 130,
+        "route_distance_km": 15.673,
+        "route_travel_time_seconds": 1267.768158
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 29083,
+        "expanded_states": 29083,
+        "examined_edges": 69453,
+        "heuristic_calls": 29901,
+        "execution_time_ms": 325.03,
+        "memory_usage_kb": 7786.5,
+        "route_nodes_count": 130,
+        "route_distance_km": 15.673,
+        "route_travel_time_seconds": 1267.768158
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 6,
+      "source_node": "5490547514",
+      "target_node": "2380732158",
+      "origin": {
+        "latitude": -6.3918775,
+        "longitude": 106.7693809
+      },
+      "destination": {
+        "latitude": -6.3891649,
+        "longitude": 106.8146816
+      },
+      "straight_distance_km": 5.015,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 3763,
+        "expanded_states": 3764,
+        "examined_edges": 9181,
+        "heuristic_calls": 0,
+        "execution_time_ms": 29.51,
+        "memory_usage_kb": 2016.29,
+        "route_nodes_count": 94,
+        "route_distance_km": 6.086,
+        "route_travel_time_seconds": 574.447331
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 4548,
+        "expanded_states": 4548,
+        "examined_edges": 10864,
+        "heuristic_calls": 4742,
+        "execution_time_ms": 72.05,
+        "memory_usage_kb": 932.96,
+        "route_nodes_count": 94,
+        "route_distance_km": 6.086,
+        "route_travel_time_seconds": 574.447331
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 7,
+      "source_node": "5631877242",
+      "target_node": "12158626201",
+      "origin": {
+        "latitude": -6.3039015,
+        "longitude": 106.7266065
+      },
+      "destination": {
+        "latitude": -6.1386194,
+        "longitude": 106.6988034
+      },
+      "straight_distance_km": 18.634,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 32910,
+        "expanded_states": 32911,
+        "examined_edges": 75419,
+        "heuristic_calls": 0,
+        "execution_time_ms": 307.04,
+        "memory_usage_kb": 30185.2,
+        "route_nodes_count": 145,
+        "route_distance_km": 27.632,
+        "route_travel_time_seconds": 1604.121125
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 44416,
+        "expanded_states": 44416,
+        "examined_edges": 100276,
+        "heuristic_calls": 45166,
+        "execution_time_ms": 584.62,
+        "memory_usage_kb": 13089.7,
+        "route_nodes_count": 145,
+        "route_distance_km": 27.632,
+        "route_travel_time_seconds": 1604.121125
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 8,
+      "source_node": "6782206924",
+      "target_node": "8785101511",
+      "origin": {
+        "latitude": -6.3615666,
+        "longitude": 106.8151745
+      },
+      "destination": {
+        "latitude": -6.296608,
+        "longitude": 106.9184283
+      },
+      "straight_distance_km": 13.505,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 45425,
+        "expanded_states": 45426,
+        "examined_edges": 105972,
+        "heuristic_calls": 0,
+        "execution_time_ms": 406.09,
+        "memory_usage_kb": 42119.97,
+        "route_nodes_count": 190,
+        "route_distance_km": 21.548,
+        "route_travel_time_seconds": 1509.909377
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 47923,
+        "expanded_states": 47923,
+        "examined_edges": 110650,
+        "heuristic_calls": 48917,
+        "execution_time_ms": 632.31,
+        "memory_usage_kb": 13153.23,
+        "route_nodes_count": 190,
+        "route_distance_km": 21.548,
+        "route_travel_time_seconds": 1509.909377
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 9,
+      "source_node": "5477200039",
+      "target_node": "2026316540",
+      "origin": {
+        "latitude": -6.3248492,
+        "longitude": 106.7347049
+      },
+      "destination": {
+        "latitude": -6.1890179,
+        "longitude": 106.7538099
+      },
+      "straight_distance_km": 15.251,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 36729,
+        "expanded_states": 36730,
+        "examined_edges": 84093,
+        "heuristic_calls": 0,
+        "execution_time_ms": 307.94,
+        "memory_usage_kb": 29913.62,
+        "route_nodes_count": 188,
+        "route_distance_km": 19.678,
+        "route_travel_time_seconds": 1365.748096
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 33677,
+        "expanded_states": 33677,
+        "examined_edges": 76179,
+        "heuristic_calls": 34729,
+        "execution_time_ms": 375.46,
+        "memory_usage_kb": 8309.93,
+        "route_nodes_count": 188,
+        "route_distance_km": 19.678,
+        "route_travel_time_seconds": 1365.748096
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 10,
+      "source_node": "7123162222",
+      "target_node": "5427948154",
+      "origin": {
+        "latitude": -6.3097467,
+        "longitude": 106.7078018
+      },
+      "destination": {
+        "latitude": -6.3567581,
+        "longitude": 106.8375409
+      },
+      "straight_distance_km": 15.261,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 37154,
+        "expanded_states": 37155,
+        "examined_edges": 86301,
+        "heuristic_calls": 0,
+        "execution_time_ms": 340.24,
+        "memory_usage_kb": 32570.05,
+        "route_nodes_count": 162,
+        "route_distance_km": 24.831,
+        "route_travel_time_seconds": 1622.821317
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 48504,
+        "expanded_states": 48504,
+        "examined_edges": 110499,
+        "heuristic_calls": 49598,
+        "execution_time_ms": 559.0,
+        "memory_usage_kb": 13146.66,
+        "route_nodes_count": 162,
+        "route_distance_km": 24.831,
+        "route_travel_time_seconds": 1622.821317
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 11,
+      "source_node": "2225756643",
+      "target_node": "7635078996",
+      "origin": {
+        "latitude": -6.2627637,
+        "longitude": 106.9367754
+      },
+      "destination": {
+        "latitude": -6.2827925,
+        "longitude": 106.7593974
+      },
+      "straight_distance_km": 19.732,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 72769,
+        "expanded_states": 72770,
+        "examined_edges": 167398,
+        "heuristic_calls": 0,
+        "execution_time_ms": 738.84,
+        "memory_usage_kb": 73851.88,
+        "route_nodes_count": 192,
+        "route_distance_km": 27.595,
+        "route_travel_time_seconds": 1822.640145
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 69403,
+        "expanded_states": 69403,
+        "examined_edges": 160666,
+        "heuristic_calls": 70854,
+        "execution_time_ms": 861.7,
+        "memory_usage_kb": 14596.07,
+        "route_nodes_count": 192,
+        "route_distance_km": 27.595,
+        "route_travel_time_seconds": 1822.640145
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 12,
+      "source_node": "5490536455",
+      "target_node": "8813996383",
+      "origin": {
+        "latitude": -6.2415357,
+        "longitude": 106.9844054
+      },
+      "destination": {
+        "latitude": -6.3733393,
+        "longitude": 106.8790917
+      },
+      "straight_distance_km": 18.716,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 46579,
+        "expanded_states": 46580,
+        "examined_edges": 111720,
+        "heuristic_calls": 0,
+        "execution_time_ms": 418.16,
+        "memory_usage_kb": 43992.99,
+        "route_nodes_count": 115,
+        "route_distance_km": 30.988,
+        "route_travel_time_seconds": 1742.504799
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 49694,
+        "expanded_states": 49694,
+        "examined_edges": 118550,
+        "heuristic_calls": 50833,
+        "execution_time_ms": 610.0,
+        "memory_usage_kb": 13149.02,
+        "route_nodes_count": 115,
+        "route_distance_km": 30.988,
+        "route_travel_time_seconds": 1742.504799
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 13,
+      "source_node": "5116663334",
+      "target_node": "5488091804",
+      "origin": {
+        "latitude": -6.1557011,
+        "longitude": 106.925794
+      },
+      "destination": {
+        "latitude": -6.179685,
+        "longitude": 106.9411974
+      },
+      "straight_distance_km": 3.164,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 1015,
+        "expanded_states": 1016,
+        "examined_edges": 2405,
+        "heuristic_calls": 0,
+        "execution_time_ms": 7.18,
+        "memory_usage_kb": 404.44,
+        "route_nodes_count": 59,
+        "route_distance_km": 4.027,
+        "route_travel_time_seconds": 524.695918
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 996,
+        "expanded_states": 996,
+        "examined_edges": 2354,
+        "heuristic_calls": 1056,
+        "execution_time_ms": 15.54,
+        "memory_usage_kb": 223.83,
+        "route_nodes_count": 59,
+        "route_distance_km": 4.027,
+        "route_travel_time_seconds": 524.695918
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 14,
+      "source_node": "7098670118",
+      "target_node": "3999617720",
+      "origin": {
+        "latitude": -6.2372475,
+        "longitude": 106.792286
+      },
+      "destination": {
+        "latitude": -6.3948825,
+        "longitude": 106.8973217
+      },
+      "straight_distance_km": 21.024,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 49252,
+        "expanded_states": 49253,
+        "examined_edges": 113153,
+        "heuristic_calls": 0,
+        "execution_time_ms": 737.63,
+        "memory_usage_kb": 47027.8,
+        "route_nodes_count": 140,
+        "route_distance_km": 30.377,
+        "route_travel_time_seconds": 1920.422709
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 94442,
+        "expanded_states": 94442,
+        "examined_edges": 214848,
+        "heuristic_calls": 96402,
+        "execution_time_ms": 2047.4,
+        "memory_usage_kb": 26274.58,
+        "route_nodes_count": 140,
+        "route_distance_km": 30.377,
+        "route_travel_time_seconds": 1920.422709
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 15,
+      "source_node": "376220291",
+      "target_node": "319948921",
+      "origin": {
+        "latitude": -6.1302487,
+        "longitude": 106.706502
+      },
+      "destination": {
+        "latitude": -6.2418806,
+        "longitude": 106.85009
+      },
+      "straight_distance_km": 20.15,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 32614,
+        "expanded_states": 32615,
+        "examined_edges": 74113,
+        "heuristic_calls": 0,
+        "execution_time_ms": 342.91,
+        "memory_usage_kb": 25079.51,
+        "route_nodes_count": 100,
+        "route_distance_km": 26.309,
+        "route_travel_time_seconds": 1581.685721
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 26308,
+        "expanded_states": 26308,
+        "examined_edges": 60789,
+        "heuristic_calls": 27439,
+        "execution_time_ms": 343.77,
+        "memory_usage_kb": 7705.58,
+        "route_nodes_count": 100,
+        "route_distance_km": 26.309,
+        "route_travel_time_seconds": 1581.685721
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 16,
+      "source_node": "2372055523",
+      "target_node": "12898565619",
+      "origin": {
+        "latitude": -6.2612794,
+        "longitude": 106.7105152
+      },
+      "destination": {
+        "latitude": -6.3684771,
+        "longitude": 106.7143062
+      },
+      "straight_distance_km": 11.927,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 28273,
+        "expanded_states": 28274,
+        "examined_edges": 65420,
+        "heuristic_calls": 0,
+        "execution_time_ms": 237.1,
+        "memory_usage_kb": 26293.75,
+        "route_nodes_count": 167,
+        "route_distance_km": 19.892,
+        "route_travel_time_seconds": 1314.587912
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 36385,
+        "expanded_states": 36385,
+        "examined_edges": 82881,
+        "heuristic_calls": 36996,
+        "execution_time_ms": 443.3,
+        "memory_usage_kb": 8477.21,
+        "route_nodes_count": 167,
+        "route_distance_km": 19.892,
+        "route_travel_time_seconds": 1314.587912
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 17,
+      "source_node": "3725743024",
+      "target_node": "5638968828",
+      "origin": {
+        "latitude": -6.2138144,
+        "longitude": 106.6916651
+      },
+      "destination": {
+        "latitude": -6.3034463,
+        "longitude": 106.7558717
+      },
+      "straight_distance_km": 12.235,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 29441,
+        "expanded_states": 29442,
+        "examined_edges": 66866,
+        "heuristic_calls": 0,
+        "execution_time_ms": 252.75,
+        "memory_usage_kb": 27145.23,
+        "route_nodes_count": 266,
+        "route_distance_km": 18.181,
+        "route_travel_time_seconds": 1333.495998
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 29694,
+        "expanded_states": 29694,
+        "examined_edges": 67426,
+        "heuristic_calls": 30374,
+        "execution_time_ms": 346.88,
+        "memory_usage_kb": 7801.93,
+        "route_nodes_count": 266,
+        "route_distance_km": 18.181,
+        "route_travel_time_seconds": 1333.495998
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 18,
+      "source_node": "5504301629",
+      "target_node": "3660144745",
+      "origin": {
+        "latitude": -6.3477592,
+        "longitude": 106.7326378
+      },
+      "destination": {
+        "latitude": -6.3945367,
+        "longitude": 106.9346009
+      },
+      "straight_distance_km": 22.917,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 39332,
+        "expanded_states": 39333,
+        "examined_edges": 92546,
+        "heuristic_calls": 0,
+        "execution_time_ms": 403.77,
+        "memory_usage_kb": 38040.38,
+        "route_nodes_count": 107,
+        "route_distance_km": 29.005,
+        "route_travel_time_seconds": 1639.84333
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 41973,
+        "expanded_states": 41973,
+        "examined_edges": 98077,
+        "heuristic_calls": 42756,
+        "execution_time_ms": 580.1,
+        "memory_usage_kb": 9106.08,
+        "route_nodes_count": 107,
+        "route_distance_km": 29.005,
+        "route_travel_time_seconds": 1639.84333
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 19,
+      "source_node": "5100784788",
+      "target_node": "4927853171",
+      "origin": {
+        "latitude": -6.159574,
+        "longitude": 106.9528028
+      },
+      "destination": {
+        "latitude": -6.096775,
+        "longitude": 106.6991643
+      },
+      "straight_distance_km": 28.899,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 52426,
+        "expanded_states": 52427,
+        "examined_edges": 124381,
+        "heuristic_calls": 0,
+        "execution_time_ms": 521.44,
+        "memory_usage_kb": 44624.55,
+        "route_nodes_count": 82,
+        "route_distance_km": 43.912,
+        "route_travel_time_seconds": 2395.879016
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 56144,
+        "expanded_states": 56144,
+        "examined_edges": 133715,
+        "heuristic_calls": 57400,
+        "execution_time_ms": 729.25,
+        "memory_usage_kb": 13210.87,
+        "route_nodes_count": 82,
+        "route_distance_km": 43.912,
+        "route_travel_time_seconds": 2395.879016
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    },
+    {
+      "pair_index": 20,
+      "source_node": "410128828",
+      "target_node": "6618441810",
+      "origin": {
+        "latitude": -6.1666921,
+        "longitude": 106.7104224
+      },
+      "destination": {
+        "latitude": -6.3845055,
+        "longitude": 106.8155197
+      },
+      "straight_distance_km": 26.861,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 62563,
+        "expanded_states": 62564,
+        "examined_edges": 145379,
+        "heuristic_calls": 0,
+        "execution_time_ms": 616.7,
+        "memory_usage_kb": 57714.88,
+        "route_nodes_count": 107,
+        "route_distance_km": 35.951,
+        "route_travel_time_seconds": 2109.042777
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 67737,
+        "expanded_states": 67737,
+        "examined_edges": 153117,
+        "heuristic_calls": 69142,
+        "execution_time_ms": 896.85,
+        "memory_usage_kb": 14415.65,
+        "route_nodes_count": 107,
+        "route_distance_km": 35.951,
+        "route_travel_time_seconds": 2109.042777
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0
+    }
+  ]
+}

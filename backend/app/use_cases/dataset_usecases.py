@@ -1,6 +1,7 @@
 import copy
 import pandas as pd
 import io
+import os
 import re
 import threading
 import time
@@ -18,6 +19,10 @@ from app.infrastructure.services.osm_graph import (
 )
 
 from fastapi import BackgroundTasks
+
+NEAREST_SINGLEFLIGHT_WAIT_SECONDS = max(
+    0.1, float(os.getenv("IMOSQUE_NEAREST_SINGLEFLIGHT_WAIT_SECONDS", "8"))
+)
 
 class DatasetUseCases:
     def __init__(self, mosque_repo: MosqueRepository, dataset_repo: DatasetRepository):
@@ -241,6 +246,29 @@ class DatasetUseCases:
             "items": items
         }
 
+    def search_mosques(
+        self,
+        dataset_id: str,
+        query_text: str,
+        limit: int = 10,
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        did = "all" if not dataset_id or dataset_id == "all" else slugify_dataset_name(dataset_id)
+        items = self.mosque_repo.search_mosques(
+            did,
+            query_text,
+            limit,
+            latitude,
+            longitude,
+        )
+        return {
+            "dataset_id": did,
+            "query": query_text,
+            "items": items,
+            "total": len(items),
+        }
+
     def get_dataset_bbox(self, dataset_id: str) -> Dict[str, Any]:
         """Calculate a robust bbox from every valid coordinate in a dataset."""
         import math
@@ -335,7 +363,10 @@ class DatasetUseCases:
                     is_owner = False
 
             if not is_owner:
-                inflight.wait()
+                if not inflight.wait(timeout=NEAREST_SINGLEFLIGHT_WAIT_SECONDS):
+                    raise TimeoutError(
+                        "Pencarian masjid identik masih diproses terlalu lama oleh database."
+                    )
                 # The owner either populated the cache, failed, or was made
                 # obsolete by a dataset mutation. Re-evaluate all three cases.
                 continue

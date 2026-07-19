@@ -4,6 +4,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Circle, MapContainer, TileLayer, Marker, Popup, Polyline, useMapEvents, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
+import { useTheme } from "@/components/theme-provider";
 
 // Custom Markers
 let StartIcon: any = null;
@@ -277,7 +278,9 @@ export default function MapComponent({
   accessConnectors = [],
   routingMode = null,
   searchRadiusKm = 10,
-  onMapClick = undefined
+  onMapClick = undefined,
+  isRouteExpanded = false,
+  selectedMosque = null
 }: { 
   center?: [number, number],
   zoom?: number,
@@ -287,9 +290,20 @@ export default function MapComponent({
   accessConnectors?: [number, number][][],
   routingMode?: string | null,
   searchRadiusKm?: number,
-  onMapClick?: (e: L.LeafletMouseEvent) => void
+  onMapClick?: (e: L.LeafletMouseEvent) => void,
+  isRouteExpanded?: boolean,
+  selectedMosque?: any
 }) {
-  const [basemap, setBasemap] = useState("osm");
+  const { resolvedTheme } = useTheme();
+  const [basemap, setBasemap] = useState("voyager");
+
+  useEffect(() => {
+    if (resolvedTheme === "dark") {
+      setBasemap("dark");
+    } else {
+      setBasemap("voyager");
+    }
+  }, [resolvedTheme]);
   const [tilesLoading, setTilesLoading] = useState(false);
   const [lowDataMode] = useState(() => {
     if (typeof navigator === "undefined") return false;
@@ -500,7 +514,15 @@ export default function MapComponent({
       )}
 
       {/* Floating Basemap Selector */}
-      <div className="absolute bottom-4 right-4 z-[1000] bg-white/70 dark:bg-slate-900/75 backdrop-blur-md border border-slate-200/50 dark:border-slate-800/50 p-1.5 rounded-2xl shadow-xl flex gap-1 pointer-events-auto transition-all">
+      <div className={`absolute z-[1000] bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border border-slate-200/30 dark:border-slate-800/50 p-1.5 rounded-2xl shadow-xl flex gap-1 pointer-events-auto transition-all duration-300 ${
+        selectedMosque ? "hidden md:flex md:bottom-4 md:right-4" : ""
+      } ${
+        hasRoute
+          ? isRouteExpanded
+            ? "hidden md:flex md:bottom-4 md:right-4"
+            : "bottom-[90px] right-4 md:bottom-4 md:right-4"
+          : "bottom-4 right-4 md:bottom-4 md:right-4"
+      }`}>
         {Object.entries(basemaps).map(([key, bm]) => (
           <button
             key={key}

@@ -1,15 +1,20 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { debouncedSaveSettings, loadSettingsFromDatabase } from "./settings-sync";
+import { debouncedSaveSettings, loadSettingsFromDatabase, saveSettingsToDatabase } from "./settings-sync";
 
 interface SearchSettings {
   algorithm: string;
   profile: string;
+  departureMode: "now" | "scheduled";
   currentTime: string;
   prayer: string;
   maxCandidates: string;
   bufferKm: string;
   autoBuild: boolean;
+  fuelPricePerLiter: string;
+  fuelEfficiencyKmPerLiter: string;
+  operatingCostPerKm: string;
+  tollCostPerKm: string;
 }
 
 type StartPointSource = "gps" | "map";
@@ -96,11 +101,16 @@ export const useAppStore = create<AppState>()(
       searchSettings: {
         algorithm: "dijkstra",
         profile: "balanced",
+        departureMode: "now",
         currentTime: "17:00",
-        prayer: "maghrib",
+        prayer: "auto",
         maxCandidates: "3",
         bufferKm: "15",
         autoBuild: false,
+        fuelPricePerLiter: "10000",
+        fuelEfficiencyKmPerLiter: "12",
+        operatingCostPerKm: "300",
+        tollCostPerKm: "1000",
       },
       setSearchSettings: (settings) => {
         set((state) => ({
@@ -174,7 +184,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "imosque-app-store",
-      version: 6,
+      version: 7,
       migrate: (persistedState) => ({
         ...(persistedState as AppState),
         routeCache: {},
@@ -203,9 +213,6 @@ export const useAppStore = create<AppState>()(
             ...(persistedState?.searchSettings || {}),
           },
         };
-        if (merged.searchSettings.bufferKm === "10" || merged.searchSettings.bufferKm === "50") {
-          merged.searchSettings.bufferKm = "15";
-        }
         // Existing installs used inline Overpass builds. Keep interactive routes fast.
         merged.searchSettings.autoBuild = false;
         
@@ -226,6 +233,21 @@ export const useAppStore = create<AppState>()(
               }));
               console.log("Settings loaded from database and merged with local state");
             } else {
+              // Jika tidak ada di database, simpan setelan default (lokal) ke database secara otomatis
+              const state = useAppStore.getState();
+              saveSettingsToDatabase({
+                searchSettings: state.searchSettings,
+                prayerSettings: {
+                  schedule: state.prayerSchedule || [],
+                  hijriDate: state.hijriDate,
+                  masehiDate: state.masehiDate,
+                }
+              }).then((saved) => {
+                if (saved) {
+                  console.log("Default settings successfully saved to database on first run");
+                }
+              }).catch(console.error);
+
               useAppStore.setState({ settingsSyncStatus: "loaded" });
             }
           }).catch((err) => {
@@ -239,3 +261,8 @@ export const useAppStore = create<AppState>()(
     }
   )
 );
+
+if (typeof window !== "undefined") {
+  (window as any).useAppStore = useAppStore;
+}
+

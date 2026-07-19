@@ -11,19 +11,37 @@ import { toast } from "sonner";
 import { formatDistance } from "@/lib/utils";
 import { Zap, ShieldAlert, BarChart3, Download, Clock } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid, Cell } from "recharts";
+import { runRouteBenchmark } from "@/lib/api";
 
-const API_BASE = typeof window !== "undefined"
-  ? `http://${window.location.hostname}:8000`
-  : "http://127.0.0.1:8000";
+interface AlgorithmBenchmark {
+  execution_time_ms: number;
+  explored_nodes: number;
+  examined_edges: number;
+  route_distance_km: number;
+  memory_usage_kb: number;
+}
+
+interface BenchmarkResult {
+  dijkstra: AlgorithmBenchmark;
+  astar: AlgorithmBenchmark;
+  comparison: {
+    faster_algorithm: string;
+    time_difference_ms: number;
+    efficiency_gain_percent: number;
+    fewer_explored_algorithm: string;
+    explored_nodes_difference: number;
+    optimal_cost_match: boolean;
+  };
+}
 
 export default function BenchmarkPanel() {
   const { activeDatasetId, startPoint, endPoint } = useAppStore();
   const [loading, setLoading] = useState(false);
-  const [benchmarkResult, setBenchmarkResult] = useState<any | null>(null);
+  const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkResult | null>(null);
 
-  const [currentTime, setCurrentTime] = useState("17:00");
+  const [currentTime] = useState("17:00");
   const [prayer, setPrayer] = useState("maghrib");
-  const [profile, setProfile] = useState("balanced");
+  const [profile] = useState("balanced");
   const [bufferKm, setBufferKm] = useState("10");
 
   const handleRunBenchmark = async () => {
@@ -55,23 +73,18 @@ export default function BenchmarkPanel() {
         search_radius_km: parseFloat(bufferKm)
       };
 
-      const res = await fetch(`${API_BASE}/api/v1/routes/benchmark`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+      const data = await runRouteBenchmark(payload, (preparation) => {
+        toast.loading(
+          preparation.message || "Menyiapkan graph jalan wilayah rute...",
+          { id: "benchmark-corridor" }
+        );
       });
-
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || "Gagal menjalankan benchmark");
-      }
-
-      const data = await res.json();
       setBenchmarkResult(data.benchmark);
       toast.success("Benchmark selesai.");
-    } catch (err: any) {
-      toast.error(err.message);
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : "Gagal menjalankan benchmark");
     } finally {
+      toast.dismiss("benchmark-corridor");
       setLoading(false);
     }
   };
@@ -97,7 +110,7 @@ export default function BenchmarkPanel() {
             Uji Performa Komparatif
           </CardTitle>
           <CardDescription>
-            Bandingkan kinerja komputasi Dijkstra vs A* secara realtime.
+            Bandingkan pathfinding murni Dijkstra bidirectional dan A* pada graph lokal yang sama.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
@@ -153,10 +166,20 @@ export default function BenchmarkPanel() {
           <CardContent className="space-y-4">
             {/* Efficiency Box */}
             <div className="p-3 bg-emerald-50 border border-emerald-100 rounded-lg text-emerald-800 text-sm">
-              Algoritma <strong>{benchmarkResult.comparison.faster_algorithm}</strong> lebih cepat{" "}
-              <strong>{benchmarkResult.comparison.time_difference_ms} ms</strong> (hemat sekitar{" "}
-              <strong>{benchmarkResult.comparison.efficiency_gain_percent}%</strong> waktu komputasi, serta menghemat{" "}
-              <strong>{benchmarkResult.comparison.nodes_saved}</strong> nodes dari eksplorasi graph).
+              {benchmarkResult.comparison.faster_algorithm === "Sama" ? (
+                <>Waktu eksekusi kedua algoritma sama.</>
+              ) : (
+                <>Algoritma <strong>{benchmarkResult.comparison.faster_algorithm}</strong> lebih cepat{" "}
+                <strong>{benchmarkResult.comparison.time_difference_ms} ms</strong> (selisih{" "}
+                <strong>{benchmarkResult.comparison.efficiency_gain_percent}%</strong>).</>
+              )}{" "}
+              {benchmarkResult.comparison.fewer_explored_algorithm === "Sama" ? (
+                <>Keduanya mengeksplorasi jumlah node yang sama.</>
+              ) : (
+                <><strong>{benchmarkResult.comparison.fewer_explored_algorithm}</strong> mengeksplorasi{" "}
+                <strong>{benchmarkResult.comparison.explored_nodes_difference}</strong> node lebih sedikit.</>
+              )}
+              {benchmarkResult.comparison.optimal_cost_match && " Bobot waktu tempuh keduanya terverifikasi sama optimal."}
             </div>
 
             {/* Comparison Table */}
@@ -179,6 +202,11 @@ export default function BenchmarkPanel() {
                     <td className="p-2.5 font-medium">Nodes Dieksplorasi</td>
                     <td className="p-2.5 text-center bg-blue-50/20 dark:bg-blue-950/10">{benchmarkResult.dijkstra.explored_nodes} nodes</td>
                     <td className="p-2.5 text-center bg-emerald-50/20 dark:bg-emerald-950/10">{benchmarkResult.astar.explored_nodes} nodes</td>
+                  </tr>
+                  <tr>
+                    <td className="p-2.5 font-medium">Edge Diperiksa</td>
+                    <td className="p-2.5 text-center bg-blue-50/20 dark:bg-blue-950/10">{benchmarkResult.dijkstra.examined_edges}</td>
+                    <td className="p-2.5 text-center bg-emerald-50/20 dark:bg-emerald-950/10">{benchmarkResult.astar.examined_edges}</td>
                   </tr>
                   <tr>
                     <td className="p-2.5 font-medium">Jarak Terpendek</td>

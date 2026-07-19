@@ -1,11 +1,20 @@
 import copy
 import hashlib
+import os
 import re
 import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from app.domain.repositories.mosque_repo import MosqueRepository
 from app.domain.repositories.dataset_repo import DatasetRepository
-from app.infrastructure.database.arangodb_client import get_db
+from app.infrastructure.database.arangodb_client import (
+    MOSQUE_SEARCH_ANALYZER,
+    MOSQUE_SEARCH_VIEW,
+    get_db,
+)
+
+NEAREST_QUERY_MAX_RUNTIME_SECONDS = max(
+    0.1, float(os.getenv("IMOSQUE_NEAREST_QUERY_MAX_RUNTIME_SECONDS", "5"))
+)
 
 def _slugify_key(text: str) -> str:
     s = str(text or "").lower().strip()
@@ -191,6 +200,76 @@ class ArangoMosqueRepository(MosqueRepository):
         res = [doc for doc in cursor]
         return res[0] if res else 0
 
+    def search_mosques(
+        self,
+        dataset_id: str,
+        query_text: str,
+        limit: int = 10,
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        db = get_db()
+        normalized_query = " ".join(str(query_text or "").strip().split())
+        if len(normalized_query) < 2:
+            return []
+        safe_limit = max(1, min(int(limit), 20))
+        has_origin = latitude is not None and longitude is not None
+        dataset_filter = "FILTER m.dataset_id == @did" if dataset_id and dataset_id != "all" else ""
+        search_fields = ("name", "address", "kecamatan", "kabko", "provinsi")
+        tokens = [
+            token
+            for token in re.findall(r"\w+", normalized_query.casefold())
+            if len(token) >= 2
+        ][:8]
+        if not tokens:
+            return []
+        token_expressions = []
+        for token_index in range(len(tokens)):
+            field_expression = " OR ".join(
+                f"m.{field} == @token_{token_index}"
+                for field in search_fields
+            )
+            token_expressions.append(f"({field_expression})")
+        search_expression = " AND ".join(token_expressions)
+        aql = f"""
+        FOR m IN {MOSQUE_SEARCH_VIEW}
+            SEARCH ANALYZER(({search_expression}), '{MOSQUE_SEARCH_ANALYZER}')
+            OPTIONS {{ waitForSync: true }}
+            {dataset_filter}
+            LET dist = @has_origin ? GEO_DISTANCE([@longitude, @latitude], m.coordinate) : null
+            SORT BM25(m) DESC, dist ASC, m.priority_score DESC
+            LIMIT @limit
+            RETURN {{
+                id: m.id, dataset_id: m.dataset_id, name: m.name,
+                address: m.address, provinsi: m.provinsi, kabko: m.kabko,
+                kecamatan: m.kecamatan, kelurahan: m.kelurahan,
+                latitude: m.latitude, longitude: m.longitude,
+                rating: m.rating, review_count: m.review_count,
+                facilities: m.facilities, fasilitas: m.fasilitas,
+                capacity_proxy: m.capacity_proxy, priority_score: m.priority_score,
+                tier: m.tier,
+                distance_km: dist == null ? null : dist / 1000
+            }}
+        """
+        bind_vars: Dict[str, Any] = {
+            "limit": safe_limit,
+            "has_origin": has_origin,
+            "latitude": float(latitude) if has_origin else 0.0,
+            "longitude": float(longitude) if has_origin else 0.0,
+        }
+        bind_vars.update({f"token_{index}": token for index, token in enumerate(tokens)})
+        if dataset_filter:
+            bind_vars["did"] = dataset_id
+        cursor = db.aql.execute(
+            aql,
+            bind_vars=bind_vars,
+            max_runtime=NEAREST_QUERY_MAX_RUNTIME_SECONDS,
+        )
+        mosques = [doc for doc in cursor]
+        for mosque in mosques:
+            self._cache_mosque(mosque)
+        return mosques
+
     def get_mosque_by_id(self, dataset_id: str, mosque_id: str) -> Optional[Dict[str, Any]]:
         with self._lookup_cache_lock:
             cached = self._lookup_cache.get((dataset_id, mosque_id))
@@ -281,7 +360,11 @@ class ArangoMosqueRepository(MosqueRepository):
         }
         if dataset_filter:
             bind_vars["did"] = dataset_id
-        cursor = db.aql.execute(query, bind_vars=bind_vars)
+        cursor = db.aql.execute(
+            query,
+            bind_vars=bind_vars,
+            max_runtime=NEAREST_QUERY_MAX_RUNTIME_SECONDS,
+        )
         mosques = [doc for doc in cursor]
         for mosque in mosques:
             self._cache_mosque(mosque)
@@ -339,7 +422,11 @@ class ArangoMosqueRepository(MosqueRepository):
                 "radius_m": radius_km * 1000,
                 "limit": limit
             }
-        cursor = db.aql.execute(query, bind_vars=bind_vars)
+        cursor = db.aql.execute(
+            query,
+            bind_vars=bind_vars,
+            max_runtime=NEAREST_QUERY_MAX_RUNTIME_SECONDS,
+        )
         mosques = [doc for doc in cursor]
         for mosque in mosques:
             self._cache_mosque(mosque)

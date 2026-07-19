@@ -1,0 +1,621 @@
+{
+  "generated_at": "2026-07-18T15:32:20.818546+00:00",
+  "methodology": {
+    "seed": 20260718,
+    "requested_pairs": 10,
+    "completed_pairs": 10,
+    "minimum_straight_distance_km": 3.0,
+    "maximum_straight_distance_km": 35.0,
+    "shortest_path_weight": "travel_time_seconds",
+    "graph_warm": true,
+    "osrm_reference_enabled": true
+  },
+  "graph": {
+    "path": "C:\\Users\\Riki Daniel\\Documents\\GitHub\\imosque-osm-dijkstra-ml-webapp-realtime\\data\\osm_cache\\road_graph_dataset_masjid_imosque_table_mosque_dki_jakarta_1.graphml",
+    "size_bytes": 274779276,
+    "nodes": 196565,
+    "edges": 456186,
+    "directed": true
+  },
+  "summary": {
+    "dijkstra": {
+      "execution_time_ms": {
+        "mean": 318.02,
+        "median": 365.975,
+        "p95": 555.054,
+        "p99": 569.307,
+        "min": 28.53,
+        "max": 572.87
+      },
+      "memory_usage_kb": {
+        "mean": 26320.686,
+        "median": 28740.125,
+        "p95": 47789.337,
+        "p99": 51500.195,
+        "min": 2016.29,
+        "max": 52427.91
+      },
+      "expanded_nodes": {
+        "mean": 30187.1,
+        "median": 34549.5,
+        "p95": 48485.75,
+        "p99": 50489.15,
+        "min": 3763.0,
+        "max": 50990.0
+      },
+      "examined_edges": {
+        "mean": 70012.4,
+        "median": 79756.0,
+        "p95": 112255.75,
+        "p99": 116368.75,
+        "min": 9181.0,
+        "max": 117397.0
+      },
+      "route_distance_km": {
+        "mean": 21.032,
+        "median": 23.116,
+        "p95": 30.135,
+        "p99": 31.773,
+        "min": 6.086,
+        "max": 32.182
+      }
+    },
+    "astar": {
+      "execution_time_ms": {
+        "mean": 520.018,
+        "median": 497.955,
+        "p95": 1002.2,
+        "p99": 1143.424,
+        "min": 51.55,
+        "max": 1178.73
+      },
+      "memory_usage_kb": {
+        "mean": 10658.862,
+        "median": 10859.38,
+        "p95": 20350.703,
+        "p99": 25023.557,
+        "min": 932.96,
+        "max": 26191.77
+      },
+      "expanded_nodes": {
+        "mean": 39034.9,
+        "median": 40376.0,
+        "p95": 72750.2,
+        "p99": 88620.44,
+        "min": 4548.0,
+        "max": 92588.0
+      },
+      "examined_edges": {
+        "mean": 89351.4,
+        "median": 92611.5,
+        "p95": 165635.15,
+        "p99": 201625.43,
+        "min": 10864.0,
+        "max": 210623.0
+      },
+      "route_distance_km": {
+        "mean": 21.032,
+        "median": 23.116,
+        "p95": 30.135,
+        "p99": 31.773,
+        "min": 6.086,
+        "max": 32.182
+      }
+    },
+    "execution_time_wins": {
+      "dijkstra": 10,
+      "astar": 0,
+      "ties": 0
+    },
+    "optimal_cost_matches": 10,
+    "optimal_cost_match_rate_percent": 100.0,
+    "maximum_cost_difference_seconds": 0.0,
+    "osrm_accuracy": {
+      "validated_pairs": 10,
+      "distance_mape_percent": 6.349,
+      "duration_mape_percent": 12.983
+    }
+  },
+  "pairs": [
+    {
+      "pair_index": 1,
+      "source_node": "4922675771",
+      "target_node": "1359356772",
+      "origin": {
+        "latitude": -6.3624873,
+        "longitude": 106.8736455
+      },
+      "destination": {
+        "latitude": -6.245029,
+        "longitude": 106.9335217
+      },
+      "straight_distance_km": 14.642,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 36189,
+        "expanded_states": 36190,
+        "examined_edges": 86642,
+        "heuristic_calls": 0,
+        "execution_time_ms": 379.04,
+        "memory_usage_kb": 27566.63,
+        "route_nodes_count": 101,
+        "route_distance_km": 25.089,
+        "route_travel_time_seconds": 1532.231487
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 36401,
+        "expanded_states": 36401,
+        "examined_edges": 84947,
+        "heuristic_calls": 37651,
+        "execution_time_ms": 446.55,
+        "memory_usage_kb": 8629.06,
+        "route_nodes_count": 101,
+        "route_distance_km": 25.089,
+        "route_travel_time_seconds": 1532.231487
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0,
+      "osrm_reference": {
+        "distance_km": 24.7359,
+        "duration_seconds": 1365.1,
+        "distance_absolute_percentage_error": 1.427,
+        "duration_absolute_percentage_error": 12.243
+      }
+    },
+    {
+      "pair_index": 2,
+      "source_node": "5129946734",
+      "target_node": "4297446426",
+      "origin": {
+        "latitude": -6.3271816,
+        "longitude": 106.8374383
+      },
+      "destination": {
+        "latitude": -6.1784391,
+        "longitude": 106.6800068
+      },
+      "straight_distance_km": 24.008,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 50990,
+        "expanded_states": 50991,
+        "examined_edges": 117397,
+        "heuristic_calls": 0,
+        "execution_time_ms": 533.28,
+        "memory_usage_kb": 52427.91,
+        "route_nodes_count": 145,
+        "route_distance_km": 32.182,
+        "route_travel_time_seconds": 2142.869989
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 92588,
+        "expanded_states": 92588,
+        "examined_edges": 210623,
+        "heuristic_calls": 94146,
+        "execution_time_ms": 1178.73,
+        "memory_usage_kb": 26191.77,
+        "route_nodes_count": 145,
+        "route_distance_km": 32.182,
+        "route_travel_time_seconds": 2142.869989
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0,
+      "osrm_reference": {
+        "distance_km": 39.9634,
+        "duration_seconds": 2189.2,
+        "distance_absolute_percentage_error": 19.471,
+        "duration_absolute_percentage_error": 2.116
+      }
+    },
+    {
+      "pair_index": 3,
+      "source_node": "5042680830",
+      "target_node": "6420409426",
+      "origin": {
+        "latitude": -6.2395089,
+        "longitude": 106.8023265
+      },
+      "destination": {
+        "latitude": -6.1811155,
+        "longitude": 106.7620417
+      },
+      "straight_distance_km": 7.873,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 7451,
+        "expanded_states": 7452,
+        "examined_edges": 16419,
+        "heuristic_calls": 0,
+        "execution_time_ms": 73.71,
+        "memory_usage_kb": 4539.68,
+        "route_nodes_count": 56,
+        "route_distance_km": 12.921,
+        "route_travel_time_seconds": 801.27971
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 8858,
+        "expanded_states": 8858,
+        "examined_edges": 19601,
+        "heuristic_calls": 9437,
+        "execution_time_ms": 90.02,
+        "memory_usage_kb": 2137.19,
+        "route_nodes_count": 56,
+        "route_distance_km": 12.921,
+        "route_travel_time_seconds": 801.27971
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0,
+      "osrm_reference": {
+        "distance_km": 12.8781,
+        "duration_seconds": 684.8,
+        "distance_absolute_percentage_error": 0.333,
+        "duration_absolute_percentage_error": 17.009
+      }
+    },
+    {
+      "pair_index": 4,
+      "source_node": "1363215579",
+      "target_node": "4996295839",
+      "origin": {
+        "latitude": -6.2143697,
+        "longitude": 106.8263494
+      },
+      "destination": {
+        "latitude": -6.3342816,
+        "longitude": 106.9015934
+      },
+      "straight_distance_km": 15.715,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 29001,
+        "expanded_states": 29002,
+        "examined_edges": 65982,
+        "heuristic_calls": 0,
+        "execution_time_ms": 299.41,
+        "memory_usage_kb": 24827.75,
+        "route_nodes_count": 128,
+        "route_distance_km": 24.684,
+        "route_travel_time_seconds": 1516.03169
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 44351,
+        "expanded_states": 44351,
+        "examined_edges": 100422,
+        "heuristic_calls": 45582,
+        "execution_time_ms": 549.36,
+        "memory_usage_kb": 13211.62,
+        "route_nodes_count": 128,
+        "route_distance_km": 24.684,
+        "route_travel_time_seconds": 1516.03169
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0,
+      "osrm_reference": {
+        "distance_km": 22.7545,
+        "duration_seconds": 1552.5,
+        "distance_absolute_percentage_error": 8.48,
+        "duration_absolute_percentage_error": 2.349
+      }
+    },
+    {
+      "pair_index": 5,
+      "source_node": "13083637898",
+      "target_node": "328919905",
+      "origin": {
+        "latitude": -6.210298,
+        "longitude": 106.9498667
+      },
+      "destination": {
+        "latitude": -6.1821817,
+        "longitude": 106.857727
+      },
+      "straight_distance_km": 10.655,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 22259,
+        "expanded_states": 22260,
+        "examined_edges": 52718,
+        "heuristic_calls": 0,
+        "execution_time_ms": 182.62,
+        "memory_usage_kb": 17039.76,
+        "route_nodes_count": 130,
+        "route_distance_km": 15.673,
+        "route_travel_time_seconds": 1267.768158
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 29083,
+        "expanded_states": 29083,
+        "examined_edges": 69453,
+        "heuristic_calls": 29901,
+        "execution_time_ms": 409.56,
+        "memory_usage_kb": 7786.5,
+        "route_nodes_count": 130,
+        "route_distance_km": 15.673,
+        "route_travel_time_seconds": 1267.768158
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0,
+      "osrm_reference": {
+        "distance_km": 16.698,
+        "duration_seconds": 911.5,
+        "distance_absolute_percentage_error": 6.138,
+        "duration_absolute_percentage_error": 39.086
+      }
+    },
+    {
+      "pair_index": 6,
+      "source_node": "5490547514",
+      "target_node": "2380732158",
+      "origin": {
+        "latitude": -6.3918775,
+        "longitude": 106.7693809
+      },
+      "destination": {
+        "latitude": -6.3891649,
+        "longitude": 106.8146816
+      },
+      "straight_distance_km": 5.015,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 3763,
+        "expanded_states": 3764,
+        "examined_edges": 9181,
+        "heuristic_calls": 0,
+        "execution_time_ms": 28.53,
+        "memory_usage_kb": 2016.29,
+        "route_nodes_count": 94,
+        "route_distance_km": 6.086,
+        "route_travel_time_seconds": 574.447331
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 4548,
+        "expanded_states": 4548,
+        "examined_edges": 10864,
+        "heuristic_calls": 4742,
+        "execution_time_ms": 51.55,
+        "memory_usage_kb": 932.96,
+        "route_nodes_count": 94,
+        "route_distance_km": 6.086,
+        "route_travel_time_seconds": 574.447331
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0,
+      "osrm_reference": {
+        "distance_km": 6.5441,
+        "duration_seconds": 454.1,
+        "distance_absolute_percentage_error": 7.0,
+        "duration_absolute_percentage_error": 26.502
+      }
+    },
+    {
+      "pair_index": 7,
+      "source_node": "5631877242",
+      "target_node": "12158626201",
+      "origin": {
+        "latitude": -6.3039015,
+        "longitude": 106.7266065
+      },
+      "destination": {
+        "latitude": -6.1386194,
+        "longitude": 106.6988034
+      },
+      "straight_distance_km": 18.634,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 32910,
+        "expanded_states": 32911,
+        "examined_edges": 75419,
+        "heuristic_calls": 0,
+        "execution_time_ms": 378.79,
+        "memory_usage_kb": 30185.2,
+        "route_nodes_count": 145,
+        "route_distance_km": 27.632,
+        "route_travel_time_seconds": 1604.121125
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 44416,
+        "expanded_states": 44416,
+        "examined_edges": 100276,
+        "heuristic_calls": 45166,
+        "execution_time_ms": 706.52,
+        "memory_usage_kb": 13089.7,
+        "route_nodes_count": 145,
+        "route_distance_km": 27.632,
+        "route_travel_time_seconds": 1604.121125
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0,
+      "osrm_reference": {
+        "distance_km": 26.9228,
+        "duration_seconds": 1746.4,
+        "distance_absolute_percentage_error": 2.634,
+        "duration_absolute_percentage_error": 8.147
+      }
+    },
+    {
+      "pair_index": 8,
+      "source_node": "6782206924",
+      "target_node": "8785101511",
+      "origin": {
+        "latitude": -6.3615666,
+        "longitude": 106.8151745
+      },
+      "destination": {
+        "latitude": -6.296608,
+        "longitude": 106.9184283
+      },
+      "straight_distance_km": 13.505,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 45425,
+        "expanded_states": 45426,
+        "examined_edges": 105972,
+        "heuristic_calls": 0,
+        "execution_time_ms": 572.87,
+        "memory_usage_kb": 42119.97,
+        "route_nodes_count": 190,
+        "route_distance_km": 21.548,
+        "route_travel_time_seconds": 1509.909377
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 47923,
+        "expanded_states": 47923,
+        "examined_edges": 110650,
+        "heuristic_calls": 48917,
+        "execution_time_ms": 786.44,
+        "memory_usage_kb": 13153.23,
+        "route_nodes_count": 190,
+        "route_distance_km": 21.548,
+        "route_travel_time_seconds": 1509.909377
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0,
+      "osrm_reference": {
+        "distance_km": 25.821099999999998,
+        "duration_seconds": 1515.6,
+        "distance_absolute_percentage_error": 16.549,
+        "duration_absolute_percentage_error": 0.375
+      }
+    },
+    {
+      "pair_index": 9,
+      "source_node": "5477200039",
+      "target_node": "2026316540",
+      "origin": {
+        "latitude": -6.3248492,
+        "longitude": 106.7347049
+      },
+      "destination": {
+        "latitude": -6.1890179,
+        "longitude": 106.7538099
+      },
+      "straight_distance_km": 15.251,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 36729,
+        "expanded_states": 36730,
+        "examined_edges": 84093,
+        "heuristic_calls": 0,
+        "execution_time_ms": 370.9,
+        "memory_usage_kb": 29913.62,
+        "route_nodes_count": 188,
+        "route_distance_km": 19.678,
+        "route_travel_time_seconds": 1365.748096
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 33677,
+        "expanded_states": 33677,
+        "examined_edges": 76179,
+        "heuristic_calls": 34729,
+        "execution_time_ms": 394.14,
+        "memory_usage_kb": 8309.93,
+        "route_nodes_count": 188,
+        "route_distance_km": 19.678,
+        "route_travel_time_seconds": 1365.748096
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0,
+      "osrm_reference": {
+        "distance_km": 19.5834,
+        "duration_seconds": 1143.7,
+        "distance_absolute_percentage_error": 0.483,
+        "duration_absolute_percentage_error": 19.415
+      }
+    },
+    {
+      "pair_index": 10,
+      "source_node": "7123162222",
+      "target_node": "5427948154",
+      "origin": {
+        "latitude": -6.3097467,
+        "longitude": 106.7078018
+      },
+      "destination": {
+        "latitude": -6.3567581,
+        "longitude": 106.8375409
+      },
+      "straight_distance_km": 15.261,
+      "dijkstra": {
+        "algorithm": "dijkstra",
+        "search_calls": 1,
+        "expanded_nodes": 37154,
+        "expanded_states": 37155,
+        "examined_edges": 86301,
+        "heuristic_calls": 0,
+        "execution_time_ms": 361.05,
+        "memory_usage_kb": 32570.05,
+        "route_nodes_count": 162,
+        "route_distance_km": 24.831,
+        "route_travel_time_seconds": 1622.821317
+      },
+      "astar": {
+        "heuristic_scale_m_per_weight_unit": 27.777738538084854,
+        "heuristic_upper_speed_kph": 99.99985873710548,
+        "algorithm": "astar",
+        "search_calls": 1,
+        "expanded_nodes": 48504,
+        "expanded_states": 48504,
+        "examined_edges": 110499,
+        "heuristic_calls": 49598,
+        "execution_time_ms": 587.31,
+        "memory_usage_kb": 13146.66,
+        "route_nodes_count": 162,
+        "route_distance_km": 24.831,
+        "route_travel_time_seconds": 1622.821317
+      },
+      "optimal_cost_match": true,
+      "absolute_cost_difference_seconds": 0.0,
+      "osrm_reference": {
+        "distance_km": 24.591,
+        "duration_seconds": 1581.9,
+        "distance_absolute_percentage_error": 0.976,
+        "duration_absolute_percentage_error": 2.587
+      }
+    }
+  ]
+}

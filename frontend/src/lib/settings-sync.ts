@@ -2,19 +2,21 @@
  * Settings Sync Utility
  * Auto-sync user settings ke database ArangoDB
  */
-
-const API_BASE = typeof window !== "undefined"
-  ? `http://${window.location.hostname}:8000`
-  : "http://127.0.0.1:8000";
+import { API_BASE } from "@/lib/config";
 
 export type SearchSettingsPayload = {
   algorithm: string;
   profile: string;
+  departureMode: "now" | "scheduled";
   currentTime: string;
   prayer: string;
   maxCandidates: string;
   bufferKm: string;
   autoBuild: boolean;
+  fuelPricePerLiter: string;
+  fuelEfficiencyKmPerLiter: string;
+  operatingCostPerKm: string;
+  tollCostPerKm: string;
 };
 
 export type PrayerSettingsPayload = {
